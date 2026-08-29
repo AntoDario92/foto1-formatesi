@@ -13,32 +13,51 @@
     .note{font-size:13px;color:#65676b;margin-top:14px}
     button,a.btn{display:block;width:100%;border:0;border-radius:12px;padding:16px 18px;font-size:18px;font-weight:700;cursor:pointer;text-decoration:none;background:#1877f2;color:white}
     #step2{display:none;margin-top:18px}
+    .status{font-size:14px;margin-top:14px;min-height:20px;color:#444}
   </style>
 </head>
 <body>
   <main class="card">
     <section id="step1">
       <h1>Foto 1</h1>
-      <p>Premi Prosegui per aprire la condivisione su Facebook. Il contenuto è già predisposto; su Facebook confermerai tu la pubblicazione.</p>
+      <p>Premi Prosegui per aprire direttamente il gruppo Facebook.</p>
       <button id="go">Prosegui</button>
-      <p class="note">Facebook decide dove mostrare il testo predisposto e richiede sempre la conferma finale.</p>
+      <div class="status" id="status"></div>
+      <p class="note">Il testo viene preparato automaticamente negli appunti. Facebook richiede comunque la conferma finale del post.</p>
     </section>
 
     <section id="step2">
       <h1>Continua</h1>
-      <p>Dopo la condivisione, prosegui per aprire la chat relativa a Foto 1.</p>
+      <p>Dopo aver pubblicato nel gruppo, prosegui per aprire la chat relativa a Foto 1.</p>
       <a class="btn" href="https://m.me/61593221212687?ref=foto1" target="_blank" rel="noopener">Prosegui</a>
     </section>
   </main>
 
 <script>
-const shareText = "Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.";
-const formatesiUrl = "https://www.facebook.com/profile.php?id=61593221212687";
-const shareUrl = "https://www.facebook.com/sharer/sharer.php?u=" + encodeURIComponent(formatesiUrl) + "&quote=" + encodeURIComponent(shareText);
+const postText = `Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.\n\nhttps://www.facebook.com/profile.php?id=61593221212687`;
+const groupUrl = "https://www.facebook.com/groups/472752960893584";
 
-document.getElementById("go").addEventListener("click", () => {
+document.getElementById("go").addEventListener("click", async () => {
+  const status = document.getElementById("status");
+  try {
+    await navigator.clipboard.writeText(postText);
+    status.textContent = "Testo pronto. Apertura del gruppo Facebook…";
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = postText;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    status.textContent = "Testo pronto. Apertura del gruppo Facebook…";
+  }
+
   document.getElementById("step2").style.display = "block";
-  window.open(shareUrl, "_blank", "noopener,noreferrer");
+  setTimeout(() => {
+    window.location.href = groupUrl;
+  }, 250);
 });
 </script>
 </body>
