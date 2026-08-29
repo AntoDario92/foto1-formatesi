@@ -10,36 +10,46 @@
     .card{width:100%;max-width:430px;background:#fff;border-radius:18px;padding:28px 22px;box-shadow:0 8px 30px rgba(0,0,0,.10);text-align:center}
     h1{font-size:26px;margin:0 0 12px}
     p{font-size:16px;line-height:1.45;margin:0 0 22px}
+    .preview{background:#f0f2f5;border-radius:12px;padding:14px;text-align:left;font-size:14px;line-height:1.45;margin:0 0 18px}
     .note{font-size:13px;color:#65676b;margin-top:14px}
-    button,a.btn{display:block;width:100%;border:0;border-radius:12px;padding:16px 18px;font-size:18px;font-weight:700;cursor:pointer;text-decoration:none;background:#1877f2;color:white}
-    #step2{display:none;margin-top:18px}
-    .status{font-size:14px;margin-top:14px;min-height:20px;color:#444}
+    button,a.btn{display:block;width:100%;border:0;border-radius:12px;padding:16px 18px;font-size:18px;font-weight:700;cursor:pointer;text-decoration:none;background:#1877f2;color:#fff}
+    #step2{display:none;margin-top:20px}
   </style>
 </head>
 <body>
   <main class="card">
     <section id="step1">
       <h1>Foto 1</h1>
-      <p>Per proseguire, il testo verrà copiato e si aprirà il gruppo Facebook. Incollalo nel post e conferma la pubblicazione su Facebook.</p>
+      <p>Il testo è già preparato. Premi Prosegui per aprire Facebook.</p>
+      <div class="preview">Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.<br><br>https://www.facebook.com/profile.php?id=61593221212687</div>
       <button id="go">Prosegui</button>
-      <div class="status" id="status"></div>
-      <p class="note">La pubblicazione avviene soltanto dopo la tua conferma su Facebook.</p>
+      <p class="note">Facebook mostrerà la schermata del gruppo e richiederà la conferma della pubblicazione.</p>
     </section>
+
     <section id="step2">
-      <h1>Continua</h1>
-      <p>Dopo aver pubblicato nel gruppo, apri la chat per richiedere Foto 1.</p>
+      <h1>Foto 1</h1>
+      <p>Dopo la conferma su Facebook, premi Prosegui per aprire la chat.</p>
       <a class="btn" href="https://m.me/61593221212687?ref=foto1" target="_blank" rel="noopener">Prosegui</a>
     </section>
   </main>
+
 <script>
 const textToCopy = `Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.\n\nhttps://www.facebook.com/profile.php?id=61593221212687`;
 const groupUrl = "https://www.facebook.com/groups/472752960893584";
+
 document.getElementById("go").addEventListener("click", async () => {
-  const status = document.getElementById("status");
-  try { await navigator.clipboard.writeText(textToCopy); status.textContent = "Testo copiato. Si apre Facebook…"; }
-  catch (e) { const ta=document.createElement("textarea"); ta.value=textToCopy; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); status.textContent="Testo copiato. Si apre Facebook…"; }
+  try {
+    await navigator.clipboard.writeText(textToCopy);
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = textToCopy;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
   document.getElementById("step2").style.display = "block";
-  setTimeout(() => { window.open(groupUrl, "_blank", "noopener"); }, 250);
+  window.open(groupUrl, "_blank", "noopener");
 });
 </script>
 </body>
