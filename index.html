@@ -10,46 +10,35 @@
     .card{width:100%;max-width:430px;background:#fff;border-radius:18px;padding:28px 22px;box-shadow:0 8px 30px rgba(0,0,0,.10);text-align:center}
     h1{font-size:26px;margin:0 0 12px}
     p{font-size:16px;line-height:1.45;margin:0 0 22px}
-    .preview{background:#f0f2f5;border-radius:12px;padding:14px;text-align:left;font-size:14px;line-height:1.45;margin:0 0 18px}
     .note{font-size:13px;color:#65676b;margin-top:14px}
-    button,a.btn{display:block;width:100%;border:0;border-radius:12px;padding:16px 18px;font-size:18px;font-weight:700;cursor:pointer;text-decoration:none;background:#1877f2;color:#fff}
-    #step2{display:none;margin-top:20px}
+    button,a.btn{display:block;width:100%;border:0;border-radius:12px;padding:16px 18px;font-size:18px;font-weight:700;cursor:pointer;text-decoration:none;background:#1877f2;color:white}
+    #step2{display:none;margin-top:18px}
   </style>
 </head>
 <body>
   <main class="card">
     <section id="step1">
       <h1>Foto 1</h1>
-      <p>Il testo è già preparato. Premi Prosegui per aprire Facebook.</p>
-      <div class="preview">Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.<br><br>https://www.facebook.com/profile.php?id=61593221212687</div>
+      <p>Premi Prosegui per aprire la condivisione su Facebook. Il contenuto è già predisposto; su Facebook confermerai tu la pubblicazione.</p>
       <button id="go">Prosegui</button>
-      <p class="note">Facebook mostrerà la schermata del gruppo e richiederà la conferma della pubblicazione.</p>
+      <p class="note">Facebook decide dove mostrare il testo predisposto e richiede sempre la conferma finale.</p>
     </section>
 
     <section id="step2">
-      <h1>Foto 1</h1>
-      <p>Dopo la conferma su Facebook, premi Prosegui per aprire la chat.</p>
+      <h1>Continua</h1>
+      <p>Dopo la condivisione, prosegui per aprire la chat relativa a Foto 1.</p>
       <a class="btn" href="https://m.me/61593221212687?ref=foto1" target="_blank" rel="noopener">Prosegui</a>
     </section>
   </main>
 
 <script>
-const textToCopy = `Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.\n\nhttps://www.facebook.com/profile.php?id=61593221212687`;
-const groupUrl = "https://www.facebook.com/groups/472752960893584";
+const shareText = "Super Consigliato. Esperienza molto positiva con FormaTesi. Tesi di Laurea perfetta.";
+const formatesiUrl = "https://www.facebook.com/profile.php?id=61593221212687";
+const shareUrl = "https://www.facebook.com/sharer/sharer.php?u=" + encodeURIComponent(formatesiUrl) + "&quote=" + encodeURIComponent(shareText);
 
-document.getElementById("go").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(textToCopy);
-  } catch (e) {
-    const ta = document.createElement("textarea");
-    ta.value = textToCopy;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-  }
+document.getElementById("go").addEventListener("click", () => {
   document.getElementById("step2").style.display = "block";
-  window.open(groupUrl, "_blank", "noopener");
+  window.open(shareUrl, "_blank", "noopener,noreferrer");
 });
 </script>
 </body>
