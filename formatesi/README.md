@@ -20,7 +20,11 @@ Email uses Resend over HTTPS. A verified sender and API key are required. Failed
 
 `ADMIN_EMAIL` becomes administrator only after completing email verification for that exact address; first registrants never gain administrator rights. Use the registration and verification flow to create the administrator. Password reset tokens expire after one hour and invalidate previous sessions. Set `LEGAL_READY=yes` only after the operator confirms the actual privacy providers, retention policy and business details. Do not enable student registrations while those values are placeholders.
 
-Optional `WHATSAPP_NUMBER` must be an international number containing digits only. Without it, the known FormaTesi Facebook page is used. No phone number has been guessed. Official university cover sheets are not included: the live preview is explicitly illustrative.
+The public contact buttons use the provided FormaTesi WhatsApp number, +39 350 581 5735, with a prefilled request for the free consultation. Optional `WHATSAPP_NUMBER` controls the contact shown inside authenticated work pages and must contain digits only. Official university cover sheets are not included: the live preview is explicitly illustrative.
+
+Facebook Login uses the server-side OAuth authorization-code flow. Configure `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET` only in Render, and register `https://formatesi.onrender.com/facebook/callback` as an exact valid OAuth redirect URI in the Meta app. FormaTesi requests only `public_profile` and `email`; Facebook supplies name, surname and email, while the student still enters the university matricola and accepts the site terms. Existing accounts are matched by verified email or Facebook ID. The app secret never reaches the browser.
+
+The university marks displayed on the public page identify the supported study paths. They remain the property of their respective owners, do not imply affiliation, and are accompanied by an explicit independence notice.
 
 ## Work lifecycle
 

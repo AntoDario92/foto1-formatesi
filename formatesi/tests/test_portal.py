@@ -63,4 +63,17 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(self.app.query('SELECT role FROM users WHERE email=?',('a@example.com',),True)['role'],'student')
   self.assertEqual(self.app.query('SELECT role FROM users WHERE email=?',('owner@example.com',),True)['role'],'admin')
   self.student.call('/nuovo');self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='T');self.assertIn('titolo del paragrafo',self.student.body);self.assertEqual(len(self.app.query('SELECT * FROM projects')),0)
+ def test_facebook_ticket_registration(self):
+  self.app.cfg.update(FACEBOOK_APP_ID='123',FACEBOOK_APP_SECRET='test-secret')
+  payload={'id':'fb-44','name':'Lucia','surname':'Verdi','email':'lucia@example.com','exp':9999999999}
+  encoded=base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).decode().rstrip('=')
+  import hashlib,hmac
+  ticket=encoded+'.'+hmac.new(b'test-secret',encoded.encode(),hashlib.sha256).hexdigest()
+  c=Client(self.app);self.assertEqual(c.call('/registrati-facebook?ticket='+urllib.parse.quote(ticket)),200)
+  self.assertIn('Lucia Verdi',c.body);self.assertNotIn('name="password"',c.body)
+  self.assertEqual(c.post('/registrati-facebook',ticket=ticket,matricola='M-998',terms='yes'),303)
+  user=self.app.query('SELECT * FROM users WHERE email=?',('lucia@example.com',),True)
+  self.assertEqual(user['facebook_id'],'fb-44');self.assertEqual(user['matricola'],'M-998');self.assertEqual(user['verified'],1)
+  c.call('/area');self.assertIn('Ciao, Lucia',c.body)
+  bad=Client(self.app);bad.call('/registrati-facebook?ticket='+urllib.parse.quote(ticket+'x'));self.assertIn('scaduta',bad.body)
 if __name__=='__main__':unittest.main()
