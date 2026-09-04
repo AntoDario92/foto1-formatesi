@@ -135,6 +135,7 @@ class Site:
    name=p.split('/')[-1]
    if name not in ['style.css','app.js','favicon.svg']:raise Failure('Pagina non trovata.',404)
    return (ROOT/'static'/name).read_bytes(),200,[('Content-Type',{'css':'text/css','js':'application/javascript','svg':'image/svg+xml'}[name.split('.')[-1]])]
+  if p=='/favicon.ico':return (ROOT/'static/favicon.svg').read_bytes(),200,[('Content-Type','image/svg+xml')]
   if p=='/health':return json.dumps({'status':'ok','portal': 'active' if self.ready else 'setup_required'}),200,[('Content-Type','application/json')]
   if p=='/robots.txt':return 'User-agent: *\nDisallow: /area\nDisallow: /lavori/\nDisallow: /gestione\nDisallow: /verifica\nDisallow: /reimposta\n',200,[('Content-Type','text/plain')]
   if p=='/':return self.page(r,'La tua tesi comincia a prendere forma',landing()),200,[]
@@ -405,7 +406,7 @@ class Site:
    proposal+='</article>'
   if admin:proposal+=f'<details class="panel"><summary>Prepara un preventivo</summary><form method="post" action="/lavori/{p["id"]}/preventivo">{r.csrf()}{field("amount","Importo complessivo in euro",extra="inputmode=decimal")}<label>Cosa comprende, tempi e revisioni incluse<textarea name="description" rows="6" required maxlength="10000"></textarea></label><button class="button">Invia la proposta</button></form></details>'
   elif not quotes:proposal+=f'<section class="panel"><h3>Vuoi proseguire insieme?</h3><p>Richiedi una proposta riferita al tuo progetto.</p><form method="post" action="/lavori/{p["id"]}/richiedi-preventivo">{r.csrf()}<button class="button">Richiedi preventivo</button></form></section>'
-  contact=self.cfg.get('WHATSAPP_NUMBER','');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
+  contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza gratuita per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
   body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside><section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
@@ -500,3 +501,4 @@ app=Site()
 if __name__=='__main__':
  from wsgiref.simple_server import make_server
  make_server('127.0.0.1',8000,app).serve_forever()
+
