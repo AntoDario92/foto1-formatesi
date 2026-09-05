@@ -28,3 +28,13 @@ document.querySelectorAll('form[data-upload]').forEach(form=>{
   }catch(error){status.textContent='Non è stato possibile leggere il file. Riprova.';button.disabled=false;submitting=false;}
  });
 });
+
+if(!window.matchMedia('(prefers-reduced-motion: reduce)').matches){
+ document.body.classList.add('reveal-ready');
+ const reveal=new IntersectionObserver(entries=>{
+  entries.forEach(entry=>{
+   if(entry.isIntersecting){entry.target.classList.add('is-visible');reveal.unobserve(entry.target);}
+  });
+ },{threshold:.08,rootMargin:'0px 0px -40px'});
+ document.querySelectorAll('.section,.university-section,.feature-section,.reviews-section').forEach(section=>reveal.observe(section));
+}
