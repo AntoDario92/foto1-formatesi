@@ -69,7 +69,7 @@ class Site:
   if self.db:
    if not self.testing and not self.db.pg:raise RuntimeError('Production requires durable PostgreSQL DATABASE_URL')
    self.db.init()
-  self.ready=bool(self.db and (self.testing or all(self.cfg.get(k) for k in ['RESEND_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL','BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'))
+  self.ready=bool(self.db and (self.testing or all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL','BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'))
  def query(self,q,args=(),one=False):
   with self.db.connect() as c:
    cur=self.db.run(c,q,args);r=cur.fetchone() if one else cur.fetchall();return dict(r) if one and r else ([dict(x) for x in r] if not one else None)
@@ -89,8 +89,12 @@ class Site:
   self.send_mail(ident,email,subject,body)
  def send_mail(self,ident,email,subject,body):
   try:
-   payload=json.dumps({'from':self.cfg['MAIL_FROM'],'to':[email],'subject':subject,'text':body}).encode()
-   req=urllib.request.Request('https://api.resend.com/emails',data=payload,headers={'Authorization':'Bearer '+self.cfg['RESEND_API_KEY'],'Content-Type':'application/json','Idempotency-Key':ident})
+   sender_email=self.cfg['MAIL_FROM'].strip()
+   sender_name=self.cfg.get('MAIL_FROM_NAME','FormaTesi').strip() or 'FormaTesi'
+   match=re.fullmatch(r'\\s*(.*?)\\s*<([^<>]+)>\\s*',sender_email)
+   if match:sender_name=match.group(1).strip() or sender_name;sender_email=match.group(2).strip()
+   payload=json.dumps({'sender':{'name':sender_name,'email':sender_email},'to':[{'email':email}],'subject':subject,'textContent':body}).encode()
+   req=urllib.request.Request('https://api.brevo.com/v3/smtp/email',data=payload,headers={'api-key':self.cfg['BREVO_API_KEY'],'Accept':'application/json','Content-Type':'application/json'})
    with urllib.request.urlopen(req,timeout=8) as response:
     if response.status not in (200,201):return
    self.mutate('UPDATE outbox SET sent=1,body=? WHERE id=?',('[Messaggio inviato]',ident))

@@ -16,7 +16,7 @@ Free Python web service, repository `AntoDario92/foto1-formatesi`, branch `main`
 
 Set variables from `.env.example`. The server will refuse local SQLite storage in production. Use a permanent external PostgreSQL database, not Render's 30-day free database. Free Render apps sleep after inactivity and have account-wide usage limits. No paid resource is provisioned by this repository.
 
-Email uses Resend over HTTPS. A verified sender and API key are required. Failed messages remain in the database outbox and can be retried explicitly from the administrator dashboard. No credentials or message text is logged.
+Email uses Brevo's transactional API over HTTPS, which also works on Render's free web service. Set `BREVO_API_KEY`, a verified `MAIL_FROM` address and optionally `MAIL_FROM_NAME` (defaults to `FormaTesi`). Failed messages remain in the database outbox and can be retried explicitly from the administrator dashboard. No credentials or message text is logged.
 
 `ADMIN_EMAIL` becomes administrator only after completing email verification for that exact address; first registrants never gain administrator rights. Use the registration and verification flow to create the administrator. Password reset tokens expire after one hour and invalidate previous sessions. Set `LEGAL_READY=yes` only after the operator confirms the actual privacy providers, retention policy and business details. Do not enable student registrations while those values are placeholders.
 
