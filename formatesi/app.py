@@ -101,9 +101,15 @@ class Site:
    self.db.run(c,'DELETE FROM tokens WHERE user_id=? AND kind=?',(user['id'],kind))
    self.db.run(c,'INSERT INTO tokens VALUES(?,?,?,?)',(digest(raw),user['id'],kind,now()+3600))
   return raw
- def notify(self,project,subject):
+ def notify(self,project,subject,message=''):
   user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
-  self.mail(user['email'],subject,'Ci sono aggiornamenti nel tuo spazio FormaTesi. Accedi qui: '+self.origin+'/lavori/'+project['id'])
+  greeting='Ciao '+user['name']+',\n\n'
+  text=(message.strip()+'\n\n' if message.strip() else 'Ci sono aggiornamenti nel tuo spazio FormaTesi.\n\n')
+  self.mail(user['email'],subject,greeting+text+'Accedi in modo sicuro alla tua richiesta:\n'+self.origin+'/lavori/'+project['id']+'\n\nFormaTesi')
+ def notify_admin(self,project,subject,message):
+  user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
+  details='\n'.join(['Studente: '+user['name']+' '+user['surname'],'Email: '+user['email'],'Matricola: '+user['matricola'],'Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Paragrafo richiesto: '+(project['paragraph'] or 'non indicato')])
+  self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),subject,message.strip()+'\n\n'+details+'\n\nApri la richiesta:\n'+self.origin+'/lavori/'+project['id'])
  def __call__(self,environ,start_response):
   self_req=Request(self,environ)
   try:body,code,headers=self.route(self_req)
@@ -335,7 +341,9 @@ class Site:
      self.db.run(c,'INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now()))
      if attachment:self.save_file(c,ident,None,attachment)
     self.audit(r.user['id'],'project.created:'+ident)
-    self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),'Nuova richiesta FormaTesi','Apri la richiesta: '+self.origin+'/lavori/'+ident)
+    project=self.query('SELECT * FROM projects WHERE id=?',(ident,),True)
+    self.notify_admin(project,'Nuova richiesta di consulenza FormaTesi','È arrivata una nuova richiesta da valutare.')
+    self.notify(project,'Abbiamo ricevuto la tua richiesta FormaTesi','La tua richiesta è arrivata correttamente. Ti avviseremo via email non appena il primo lavoro sarà disponibile nella tua area personale.')
     return self.redirect('/lavori/'+ident)
    except Failure as e:error=e.message
   options='<option value="">Scegli il tuo ateneo</option>'+''.join(f'<option>{esc(x)}</option>' for x in ATENEI)
@@ -388,8 +396,14 @@ class Site:
    elif action=='richiedi-preventivo':
     if not self.db.run(c,'SELECT id FROM events WHERE project_id=? AND kind=?',(p['id'],'quote_request')).fetchone():self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'quote_request','Richiesto un preventivo per proseguire.',p['revision'],now()))
   self.audit(r.user['id'],action+':'+p['id'])
-  if action in ['consegna','preventivo']:self.notify(p,'Il tuo lavoro su FormaTesi è stato aggiornato')
-  else:self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),'Aggiornamento richiesta FormaTesi',self.origin+'/lavori/'+p['id'])
+  updated=self.query('SELECT * FROM projects WHERE id=?',(p['id'],),True)
+  if action=='consegna':
+   if updated['revision']==0:self.notify(updated,'Il tuo primo lavoro FormaTesi è pronto','Abbiamo pubblicato il primo paragrafo o capitolo richiesto. Puoi leggerlo e scaricare gli eventuali allegati dalla tua area personale.')
+   else:self.notify(updated,'La revisione n. '+str(updated['revision'])+' è pronta','Abbiamo pubblicato la revisione n. '+str(updated['revision'])+'. La nuova versione e quelle precedenti restano disponibili nella tua area personale.')
+  elif action=='preventivo':self.notify(updated,'Hai ricevuto una proposta FormaTesi','La proposta personalizzata per proseguire è disponibile nella tua area personale. Potrai leggerla prima di confermare il tuo interesse.')
+  elif action=='revisione':self.notify_admin(updated,'Nuova richiesta di revisione FormaTesi','Lo studente ha inviato indicazioni per una revisione del lavoro.')
+  elif action=='richiedi-preventivo':self.notify_admin(updated,'Richiesta di preventivo FormaTesi','Lo studente desidera ricevere una proposta per continuare il lavoro.')
+  elif action=='accetta':self.notify_admin(updated,'Proposta FormaTesi accettata','Lo studente ha confermato il proprio interesse per la proposta pubblicata.')
   return self.redirect('/lavori/'+p['id'])
  def project_page(self,r,p):
   admin=r.user['role']=='admin';events=self.query('SELECT * FROM events WHERE project_id=? ORDER BY created,id',(p['id'],));files=self.query('SELECT id,event_id,name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
