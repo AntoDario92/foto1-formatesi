@@ -53,3 +53,22 @@ body{font-size:20px;line-height:1.72}.hero-copy>p{font-size:22px;line-height:1.7
 @keyframes brand-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-9px)}}@keyframes brand-glow{0%,100%{box-shadow:0 28px 65px rgba(7,21,46,.3)}50%{box-shadow:0 32px 80px rgba(169,13,70,.28)}}@keyframes cta-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.025)}}@keyframes cta-shine{0%,45%{left:-25%}70%,100%{left:125%}}@keyframes logo-rise{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
 @media(max-width:760px){body{font-size:18px}.hero-copy>p{font-size:20px}.section-heading>p,.feature-section p,.steps p,.support-grid p,.faq details p{font-size:18px}.button{font-size:17px}.hero h1{font-size:clamp(48px,15vw,64px)}.proof-chip{font-size:15px;border-radius:13px;width:100%}}
 @media(prefers-reduced-motion:reduce){.hero-visual,.hero-actions .conversion,.hero-actions .conversion:after,.uni-logo{animation:none!important}.reveal-ready .section,.reveal-ready .university-section,.reveal-ready .feature-section,.reveal-ready .reviews-section{opacity:1;transform:none}}
+
+/* Atenei e fotografie del traguardo */
+.university-logos{grid-template-columns:repeat(4,1fr)}
+.uni-logo{position:relative;text-align:center;overflow:hidden}
+.uni-logo.name-only{background:linear-gradient(145deg,#fff,#f8edf2);color:var(--ink);font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:1.25;filter:none}
+.uni-logo.name-only strong{color:var(--blue);font-size:21px}
+.uni-logo.featured>span{font-family:Georgia,'Times New Roman',serif;font-size:22px;font-weight:700;color:var(--ink)}
+.other-universities{text-align:center;max-width:850px;margin:28px auto 0;font-size:18px!important;color:var(--ink)}
+.graduation-story{max-width:1440px;margin:0 auto;padding:90px 6%;display:grid;grid-template-columns:1.55fr .65fr;gap:24px;background:linear-gradient(180deg,#fff,#f8f9fc)}
+.graduation-main{position:relative;min-height:620px;border-radius:26px;overflow:hidden;background:#07152e;box-shadow:0 28px 70px rgba(7,21,46,.17)}
+.graduation-main>img{position:absolute;width:100%;height:100%;object-fit:cover}
+.graduation-main:after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(4,14,33,.88) 0%,rgba(4,14,33,.58) 42%,rgba(4,14,33,.05) 72%)}
+.graduation-copy{position:relative;z-index:1;width:55%;padding:64px 48px;color:white}
+.graduation-copy .eyebrow{color:#f0c4d4}.graduation-copy h2{font-size:clamp(38px,4vw,58px);margin:20px 0}.graduation-copy p{color:#eef1f7;font-size:20px;line-height:1.65}
+.graduation-small{align-self:end;background:#fff;border:1px solid var(--line);border-radius:20px;overflow:hidden;box-shadow:0 18px 50px rgba(7,21,46,.1);transform:translateY(25px)}
+.graduation-small img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover}.graduation-small p{padding:24px;margin:0;font-size:17px;color:var(--ink)}
+.graduation-small strong{color:var(--blue)}
+@media(max-width:900px){.graduation-story{grid-template-columns:1fr}.graduation-main{min-height:680px}.graduation-copy{width:70%}.graduation-small{display:grid;grid-template-columns:1fr 1fr;align-items:center;transform:none}.university-logos{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){.university-logos{grid-template-columns:1fr 1fr}.uni-logo.name-only{font-size:15px}.uni-logo.name-only strong{font-size:17px}.graduation-story{padding:58px 5%}.graduation-main{min-height:690px}.graduation-main:after{background:linear-gradient(0deg,rgba(4,14,33,.94) 0%,rgba(4,14,33,.48) 68%,rgba(4,14,33,.08) 100%)}.graduation-main>img{object-position:64% center}.graduation-copy{position:absolute;bottom:0;width:100%;padding:34px 25px}.graduation-copy h2{font-size:36px}.graduation-copy p{font-size:18px}.graduation-small{grid-template-columns:1fr}.graduation-small p{font-size:17px}}
