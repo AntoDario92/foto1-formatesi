@@ -135,7 +135,7 @@ class Site:
   p=r.path
   if p.startswith('/static/'):
    name=p.split('/')[-1]
-   if name not in ['style.css','app.js','favicon.svg','formatesi-logo.webp','formatesi-icon.webp']:raise Failure('Pagina non trovata.',404)
+   if name not in ['style.css','app.js','favicon.svg','formatesi-logo.webp','formatesi-icon.webp','laureati-formatesi.webp','tesi-laurea-formatesi.webp']:raise Failure('Pagina non trovata.',404)
    return (ROOT/'static'/name).read_bytes(),200,[('Content-Type',{'css':'text/css','js':'application/javascript','svg':'image/svg+xml','webp':'image/webp'}[name.split('.')[-1]])]
   if p=='/favicon.ico':return (ROOT/'static/favicon.svg').read_bytes(),200,[('Content-Type','image/svg+xml')]
   if p=='/health':return json.dumps({'status':'ok','portal': 'active' if self.ready else 'setup_required'}),200,[('Content-Type','application/json')]
