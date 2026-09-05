@@ -76,4 +76,13 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(user['facebook_id'],'fb-44');self.assertEqual(user['matricola'],'M-998');self.assertEqual(user['verified'],1)
   c.call('/area');self.assertIn('Ciao, Lucia',c.body)
   bad=Client(self.app);bad.call('/registrati-facebook?ticket='+urllib.parse.quote(ticket+'x'));self.assertIn('scaduta',bad.body)
+ def test_verified_facebook_reviews(self):
+  self.admin.call('/area');self.assertIn('Gestisci recensioni',self.admin.body)
+  self.assertEqual(self.student.call('/gestione/recensioni'),403)
+  self.admin.call('/gestione/recensioni')
+  self.assertEqual(self.admin.post('/gestione/recensioni',author='Giulia <Test>',body='Servizio preciso & puntuale',rating='5',review_date='2026-09-05',review_url='https://example.com/falsa'),400)
+  self.admin.call('/gestione/recensioni')
+  self.assertEqual(self.admin.post('/gestione/recensioni',author='Giulia <Test>',body='Servizio preciso & puntuale',rating='5',review_date='2026-09-05',review_url='https://www.facebook.com/example/reviews/123'),303)
+  public=Client(self.app);self.assertEqual(public.call('/'),200)
+  self.assertIn('Servizio preciso &amp; puntuale',public.body);self.assertIn('Giulia &lt;Test&gt;',public.body);self.assertIn('Recensione originale su Facebook',public.body)
 if __name__=='__main__':unittest.main()
