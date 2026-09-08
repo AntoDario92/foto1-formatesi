@@ -60,7 +60,11 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    if self.pg:contact_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='contact_email'").fetchone()
    else:contact_found=any(x['name']=='contact_email' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
    if not contact_found:self.run(c,'ALTER TABLE users ADD COLUMN contact_email TEXT')
+   if self.pg:username_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username'").fetchone()
+   else:username_found=any(x['name']=='username' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not username_found:self.run(c,'ALTER TABLE users ADD COLUMN username TEXT')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
+   self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
 
 class Site:
  def __init__(self,config=None):
@@ -338,27 +342,31 @@ class Site:
      if r.data.get('terms')!='yes':raise Failure('Leggi e accetta l’informativa per continuare.')
      contact=r.data.get('contact_email','').strip().lower()
      if contact and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',contact):raise Failure('Controlla l’indirizzo email facoltativo.')
+     username=r.data.get('username','').strip().lower()
+     if username and not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,29}',username):raise Failure('Lo username deve avere da 3 a 30 caratteri e può contenere lettere, numeri, punto, trattino o trattino basso.')
+     if username and self.query('SELECT id FROM users WHERE username=?',(username,),True):raise Failure('Questo username è già utilizzato. Scegline un altro.')
      while True:
       code='FT-'+secrets.token_hex(2).upper()+'-'+secrets.token_hex(2).upper()
       if not self.query('SELECT id FROM users WHERE matricola=?',(code,),True):break
      ident=uid();internal=code.lower()+'@pratica.invalid'
-     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email) VALUES(?,?,?,?,?,?,1,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact or None))
+     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email,username) VALUES(?,?,?,?,?,?,1,?,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact or None,username or None))
      user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);r.login(user);self.audit(user['id'],'code.registration')
      if contact:self.mail(contact,'Il tuo codice pratica FormaTesi','Conserva questo codice: '+code+'\n\nPer accedere: '+self.origin+'/login')
-     body=f'''<section class="narrow panel code-success"><span class="eyebrow">IL TUO ACCESSO RISERVATO</span><h1>Conserva questo codice.</h1><p>È l’unico identificativo della tua pratica. Non contiene il tuo nome né la tua matricola.</p><div class="practice-code" aria-label="Codice pratica">{esc(code)}</div><p class="notice">Salvalo adesso insieme alla password: senza email facoltativa non potremo recuperarlo.</p><a class="button full" href="/nuovo">Inserisci i dati della tesi ↗</a></section>'''
+     username_note=f'<p><strong>Username:</strong> {esc(username)}</p>' if username else ''
+     body=f'''<section class="narrow panel code-success"><span class="eyebrow">IL TUO ACCESSO RISERVATO</span><h1>Conserva le credenziali.</h1><p>Puoi entrare con il codice pratica oppure con lo username scelto.</p><div class="practice-code" aria-label="Codice pratica">{esc(code)}</div>{username_note}<p class="notice">Salva codice, username e password: senza email facoltativa non potremo recuperarli.</p><a class="button full" href="/nuovo">Inserisci i dati della tesi ↗</a></section>'''
      return self.page(r,'Il tuo codice pratica',body),200,[]
     identifier=r.data.get('identifier','').strip()
-    user=self.query('SELECT * FROM users WHERE matricola=? OR email=?',(identifier.upper(),identifier.lower()),True)
-    if not user or not password_ok(password,user['password']):raise Failure('Codice pratica o password non corretti.')
+    user=self.query('SELECT * FROM users WHERE matricola=? OR username=? OR email=?',(identifier.upper(),identifier.lower(),identifier.lower()),True)
+    if not user or not password_ok(password,user['password']):raise Failure('Codice pratica, username o password non corretti.')
     if '@' in identifier and user['role']!='admin':raise Failure('Per gli studenti è necessario usare il codice pratica.')
     r.login(user);self.audit(user['id'],'code.login');return self.redirect('/area')
    except Failure as e:error=e.message
   if r.path=='/registrati':
-   fields=field('contact_email','Email per gli avvisi (facoltativa)','email',autocomplete='email',required=False,placeholder='Puoi lasciarla vuota')+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa sul portale a codice</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
+   fields=field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice pratica per accedere.</p>'+field('contact_email','Email per gli avvisi (facoltativa)','email',autocomplete='email',required=False,placeholder='Puoi lasciarla vuota')+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa sul portale a codice</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
    title='Apri la tua pratica.<br>Senza nome né matricola.';intro='Riceverai un codice casuale. Usalo con la password per seguire consegne e revisioni.';label='Genera il mio codice'
   else:
-   fields=field('identifier','Codice pratica','text',autocomplete='username',placeholder='FT-XXXX-XXXX')+field('password','Password','password',autocomplete='current-password')
-   title='Rientra nella<br>tua pratica.';intro='Inserisci il codice ricevuto alla registrazione e la tua password.';label='Accedi alla pratica'
+   fields=field('identifier','Codice pratica o username','text',autocomplete='username',placeholder='FT-XXXX-XXXX oppure il tuo username')+field('password','Password','password',autocomplete='current-password')
+   title='Rientra nella<br>tua pratica.';intro='Inserisci il codice pratica oppure lo username, poi la password.';label='Accedi alla pratica'
   body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">PORTALE RISERVATO</span><h1>{title}</h1><p>{intro}</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+f'<form method="post">{r.csrf()}{fields}<button class="button full">{label} ↗</button></form><div class="auth-links"><a href="/login">Ho già un codice</a><a href="/registrati">Crea una pratica</a></div></div></section>'
   return self.page(r,label,body),200,[]
  def dashboard(self,r):
