@@ -73,6 +73,8 @@ class Site:
    if not self.testing and not self.db.pg:raise RuntimeError('Production requires durable PostgreSQL DATABASE_URL')
    self.db.init()
   self.code_mode=self.cfg.get('CODE_PORTAL')=='yes'
+  if self.db and self.code_mode and self.cfg.get('ADMIN_EMAIL') and not self.query('SELECT id FROM users WHERE email=?',(self.cfg['ADMIN_EMAIL'].lower(),),True):
+   self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,1,?,?)',(uid(),'FormaTesi','Gestore',self.cfg['ADMIN_EMAIL'].lower(),password_hash(secrets.token_urlsafe(40)),'GESTORE','admin',now()))
   essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
   legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
   self.ready=bool(self.db and (self.testing or essentials and (legal or self.code_mode)))
