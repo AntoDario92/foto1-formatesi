@@ -16,7 +16,7 @@ class PublicRequest:
 
 
 def absolute_app_links(document):
-    for path in ("/login", "/anteprima"):
+    for path in ("/registrati", "/login", "/anteprima"):
         document = document.replace(f'href="{path}"', f'href="{BACKEND}{path}"')
     return document
 
@@ -32,6 +32,6 @@ if OUT.exists():
     shutil.rmtree(OUT)
 OUT.mkdir()
 shutil.copytree(ROOT / "static", OUT / "static")
-write_page(Path("."), "La tua tesi comincia a prendere forma", public_landing([], False))
+write_page(Path("."), "La tua tesi comincia a prendere forma", public_landing([], True))
 write_page(Path("privacy"), "Privacy", legal(Site({}), "/privacy"))
 write_page(Path("condizioni"), "Condizioni del servizio", legal(Site({}), "/condizioni"))
