@@ -77,7 +77,7 @@ class Site:
    self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,1,?,?)',(uid(),'FormaTesi','Gestore',self.cfg['ADMIN_EMAIL'].lower(),password_hash(secrets.token_urlsafe(40)),'GESTORE','admin',now()))
   essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
   legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
-  self.ready=bool(self.db and (self.testing or essentials and (legal or self.code_mode)))
+  self.ready=bool(self.db and (self.testing or self.code_mode or (essentials and legal)))
  def query(self,q,args=(),one=False):
   with self.db.connect() as c:
    cur=self.db.run(c,q,args);r=cur.fetchone() if one else cur.fetchall();return dict(r) if one and r else ([dict(x) for x in r] if not one else None)
