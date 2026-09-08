@@ -16,6 +16,15 @@ class PublicRequest:
 
 
 def absolute_app_links(document):
+    consultation = (
+        '<a class="button small" href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20per%20la%20mia%20tesi." '
+        'target="_blank" rel="noopener">Consulenza gratuita <span aria-hidden="true">↗</span></a>'
+    )
+    portal_access = (
+        f'<a href="{BACKEND}/login">Accedi</a>'
+        f'<a class="button small" href="{BACKEND}/registrati">Paragrafo gratuito <span aria-hidden="true">↗</span></a>'
+    )
+    document = document.replace(consultation, portal_access)
     for path in ("/registrati", "/login", "/anteprima"):
         document = document.replace(f'href="{path}"', f'href="{BACKEND}{path}"')
     return document
