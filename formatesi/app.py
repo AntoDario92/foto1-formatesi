@@ -79,6 +79,9 @@ class Site:
   self.code_mode=self.cfg.get('CODE_PORTAL')=='yes'
   if self.db and self.code_mode and self.cfg.get('ADMIN_EMAIL') and not self.query('SELECT id FROM users WHERE email=?',(self.cfg['ADMIN_EMAIL'].lower(),),True):
    self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,1,?,?)',(uid(),'FormaTesi','Gestore',self.cfg['ADMIN_EMAIL'].lower(),password_hash(secrets.token_urlsafe(40)),'GESTORE','admin',now()))
+  if self.db and self.code_mode and self.cfg.get('ADMIN_EMAIL') and self.cfg.get('ADMIN_SETUP_PASSWORD'):
+   admin=self.query('SELECT * FROM users WHERE email=?',(self.cfg['ADMIN_EMAIL'].lower(),),True)
+   if admin:self.mutate('UPDATE users SET password=?,username=?,verified=1,role=? WHERE id=?',(password_hash(self.cfg['ADMIN_SETUP_PASSWORD']),'gestore_formatesi_92','admin',admin['id']))
   essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
   legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
   self.ready=bool(self.db and (self.testing or self.code_mode or (essentials and legal)))
@@ -110,7 +113,8 @@ class Site:
    with urllib.request.urlopen(req,timeout=8) as response:
     if response.status not in (200,201):return
    self.mutate('UPDATE outbox SET sent=1,body=? WHERE id=?',('[Messaggio inviato]',ident))
-  except Exception:pass # Retained outbox permits an explicit admin retry without losing deliveries.
+  except Exception:
+   import logging;logging.exception('Email FormaTesi non inviata') # Retained outbox permits an explicit admin retry without losing deliveries.
  def token(self,user,kind):
   raw=secrets.token_urlsafe(32)
   with self.db.connect() as c:
