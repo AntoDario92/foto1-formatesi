@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
     found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='facebook_id'").fetchone()
    else:found=any(x['name']=='facebook_id' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
    if not found:self.run(c,'ALTER TABLE users ADD COLUMN facebook_id TEXT')
+   if self.pg:contact_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='contact_email'").fetchone()
+   else:contact_found=any(x['name']=='contact_email' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not contact_found:self.run(c,'ALTER TABLE users ADD COLUMN contact_email TEXT')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
 
 class Site:
@@ -69,7 +72,10 @@ class Site:
   if self.db:
    if not self.testing and not self.db.pg:raise RuntimeError('Production requires durable PostgreSQL DATABASE_URL')
    self.db.init()
-  self.ready=bool(self.db and (self.testing or all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL','BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'))
+  self.code_mode=self.cfg.get('CODE_PORTAL')=='yes'
+  essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
+  legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
+  self.ready=bool(self.db and (self.testing or essentials and (legal or self.code_mode)))
  def query(self,q,args=(),one=False):
   with self.db.connect() as c:
    cur=self.db.run(c,q,args);r=cur.fetchone() if one else cur.fetchall();return dict(r) if one and r else ([dict(x) for x in r] if not one else None)
@@ -107,12 +113,16 @@ class Site:
   return raw
  def notify(self,project,subject,message=''):
   user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
-  greeting='Ciao '+user['name']+',\n\n'
+  email=user.get('contact_email') or (user['email'] if not user['email'].endswith('@pratica.invalid') else '')
+  if not email:return
+  greeting='Ciao,\n\n'
   text=(message.strip()+'\n\n' if message.strip() else 'Ci sono aggiornamenti nel tuo spazio FormaTesi.\n\n')
-  self.mail(user['email'],subject,greeting+text+'Accedi in modo sicuro alla tua richiesta:\n'+self.origin+'/lavori/'+project['id']+'\n\nFormaTesi')
+  access=(self.origin+'/login\n\nCodice pratica: '+user['matricola'] if user['email'].endswith('@pratica.invalid') else self.origin+'/lavori/'+project['id'])
+  self.mail(email,subject,greeting+text+'Accedi in modo sicuro alla tua richiesta:\n'+access+'\n\nFormaTesi')
  def notify_admin(self,project,subject,message):
   user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
-  details='\n'.join(['Studente: '+user['name']+' '+user['surname'],'Email: '+user['email'],'Matricola: '+user['matricola'],'Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Paragrafo richiesto: '+(project['paragraph'] or 'non indicato')])
+  identity=(['Codice pratica: '+user['matricola']] if user['email'].endswith('@pratica.invalid') else ['Studente: '+user['name']+' '+user['surname'],'Email: '+user['email'],'Matricola: '+user['matricola']])
+  details='\n'.join(identity+['Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Paragrafo richiesto: '+(project['paragraph'] or 'non indicato')])
   self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),subject,message.strip()+'\n\n'+details+'\n\nApri la richiesta:\n'+self.origin+'/lavori/'+project['id'])
  def __call__(self,environ,start_response):
   self_req=Request(self,environ)
@@ -241,6 +251,7 @@ class Site:
   return project
  def auth(self,r):
   p=r.path;error='';message=''
+  if self.code_mode and p in ['/registrati','/login']:return self.code_auth(r)
   if p=='/verifica':
    token=self.query('SELECT * FROM tokens WHERE id=? AND kind=? AND expires>?',(digest(r.q.get('token','')),'verify',now()),True)
    if not token:raise Failure('Link scaduto o già utilizzato. Puoi richiederne un altro dalla pagina di accesso.')
@@ -313,6 +324,40 @@ class Site:
   label={'/registrati':'Crea il tuo account','/login':'Accedi','/recupera':'Invia il link','/reimposta':'Salva la password','/registrati-facebook':'Entra nella tua area'}[p]
   facebook_button='' if p in ['/recupera','/reimposta','/registrati-facebook'] else '<a class="facebook-login" href="/facebook"><span aria-hidden="true">f</span> Continua con Facebook</a><div class="form-divider"><span>oppure</span></div>'
   body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">Il tuo spazio FormaTesi</span><h1>{esc(title).replace(chr(10),"<br>")}</h1><p>La tua richiesta, le consegne e ogni revisione. Tutto nello stesso posto.</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="status" class="notice">{esc(message)}</div>' if message else '')+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+facebook_button+f'<form method="post">{r.csrf()}{fields}<button class="button full">{label} ↗</button></form><div class="auth-links"><a href="/login">Accedi</a><a href="/registrati">Registrati</a><a href="/recupera">Password dimenticata?</a></div></div></section>'
+  return self.page(r,label,body),200,[]
+ def code_auth(self,r):
+  error=''
+  if r.method=='POST':
+   self.limit('code-auth:'+r.ip,20,3600)
+   try:
+    password=r.password()
+    if r.path=='/registrati':
+     self.limit('code-register:'+r.ip,5,3600)
+     if r.data.get('terms')!='yes':raise Failure('Leggi e accetta l’informativa per continuare.')
+     contact=r.data.get('contact_email','').strip().lower()
+     if contact and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',contact):raise Failure('Controlla l’indirizzo email facoltativo.')
+     while True:
+      code='FT-'+secrets.token_hex(2).upper()+'-'+secrets.token_hex(2).upper()
+      if not self.query('SELECT id FROM users WHERE matricola=?',(code,),True):break
+     ident=uid();internal=code.lower()+'@pratica.invalid'
+     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email) VALUES(?,?,?,?,?,?,1,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact or None))
+     user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);r.login(user);self.audit(user['id'],'code.registration')
+     if contact:self.mail(contact,'Il tuo codice pratica FormaTesi','Conserva questo codice: '+code+'\n\nPer accedere: '+self.origin+'/login')
+     body=f'''<section class="narrow panel code-success"><span class="eyebrow">IL TUO ACCESSO RISERVATO</span><h1>Conserva questo codice.</h1><p>È l’unico identificativo della tua pratica. Non contiene il tuo nome né la tua matricola.</p><div class="practice-code" aria-label="Codice pratica">{esc(code)}</div><p class="notice">Salvalo adesso insieme alla password: senza email facoltativa non potremo recuperarlo.</p><a class="button full" href="/nuovo">Inserisci i dati della tesi ↗</a></section>'''
+     return self.page(r,'Il tuo codice pratica',body),200,[]
+    identifier=r.data.get('identifier','').strip()
+    user=self.query('SELECT * FROM users WHERE matricola=? OR email=?',(identifier.upper(),identifier.lower()),True)
+    if not user or not password_ok(password,user['password']):raise Failure('Codice pratica o password non corretti.')
+    if '@' in identifier and user['role']!='admin':raise Failure('Per gli studenti è necessario usare il codice pratica.')
+    r.login(user);self.audit(user['id'],'code.login');return self.redirect('/area')
+   except Failure as e:error=e.message
+  if r.path=='/registrati':
+   fields=field('contact_email','Email per gli avvisi (facoltativa)','email',autocomplete='email',required=False,placeholder='Puoi lasciarla vuota')+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa sul portale a codice</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
+   title='Apri la tua pratica.<br>Senza nome né matricola.';intro='Riceverai un codice casuale. Usalo con la password per seguire consegne e revisioni.';label='Genera il mio codice'
+  else:
+   fields=field('identifier','Codice pratica','text',autocomplete='username',placeholder='FT-XXXX-XXXX')+field('password','Password','password',autocomplete='current-password')
+   title='Rientra nella<br>tua pratica.';intro='Inserisci il codice ricevuto alla registrazione e la tua password.';label='Accedi alla pratica'
+  body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">PORTALE RISERVATO</span><h1>{title}</h1><p>{intro}</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+f'<form method="post">{r.csrf()}{fields}<button class="button full">{label} ↗</button></form><div class="auth-links"><a href="/login">Ho già un codice</a><a href="/registrati">Crea una pratica</a></div></div></section>'
   return self.page(r,label,body),200,[]
  def dashboard(self,r):
   admin=r.user['role']=='admin';status=r.q.get('stato','');search=r.q.get('q','').strip()
@@ -566,6 +611,11 @@ def demo():
 
 def legal(site,path):
  if not site.ready:return '<section class="narrow panel"><span class="eyebrow">ANTEPRIMA FORMATESI</span><h1>'+('Privacy' if path=='/privacy' else 'Condizioni del servizio')+'</h1><p>L’area di registrazione non è ancora attiva e questa anteprima non raccoglie richieste o documenti degli studenti. Il sito non utilizza strumenti pubblicitari o di analisi del traffico. Il fornitore di hosting può trattare i dati tecnici necessari all’erogazione del sito.</p><p>Le informazioni complete sul titolare e sulle condizioni saranno pubblicate prima dell’apertura delle registrazioni.</p><a href="'+FB+'">Contatta FormaTesi</a></section>'
+ if site.code_mode:
+  contact=esc(site.cfg.get('PRIVACY_CONTACT') or site.cfg.get('ADMIN_EMAIL') or 'aiutotesidilaurea@proton.me')
+  if path=='/privacy':text=f'''<h1>Informativa del portale a codice</h1><p>Contatto per le richieste relative ai dati: {contact}.</p><h2>Dati ridotti al minimo</h2><p>Il portale non richiede nome, cognome o matricola. Conserva il codice casuale della pratica, la password in forma protetta, i dati accademici inseriti e gli eventuali materiali caricati. L’email è facoltativa e viene usata soltanto per gli avvisi richiesti.</p><h2>Sicurezza e fornitori</h2><p>I servizi tecnici di hosting, database e invio email possono trattare i dati necessari al funzionamento e alla sicurezza. Non utilizziamo pubblicità, profilazione o analisi commerciali del traffico.</p><h2>Scelte dello studente</h2><p>Non inserire nomi, matricole, recapiti o altri dati personali nei titoli e nei documenti. Puoi chiedere accesso o cancellazione indicando il codice pratica al contatto riportato sopra.</p><h2>Cookie</h2><p>Viene utilizzato soltanto il cookie tecnico necessario a mantenere l’accesso sicuro alla pratica.</p>'''
+  else:text='''<h1>Condizioni del portale a codice</h1><p>FormaTesi offre supporto alla ricerca, alla revisione e all’organizzazione dell’elaborato. Lo studente rimane responsabile del lavoro presentato e del rispetto delle regole del proprio ateneo.</p><h2>Prova gratuita</h2><p>La prova viene valutata in base ai materiali e alla disponibilità. Il codice pratica deve essere conservato: insieme alla password consente di consultare lo stato, le consegne e le revisioni.</p><h2>Materiali</h2><p>È vietato caricare frontespizi o file contenenti nome, matricola, firme, documenti di identità o dati personali non necessari. Non sono garantiti voti, approvazioni o risultati di software di rilevazione.</p>'''
+  return '<section class="narrow panel legal">'+text+'</section>'
  business=esc(site.cfg.get('BUSINESS_NAME'));contact=esc(site.cfg.get('PRIVACY_CONTACT'))
  if path=='/privacy':text=f'''<h1>Informativa privacy</h1><p>Titolare del trattamento: {business}. Contatto: {contact}.</p><h2>Dati e finalità</h2><p>Trattiamo nome, cognome, email e matricola per gestire l’account. I dati del percorso universitario, i testi e gli allegati servono a valutare le richieste e fornire il supporto richiesto. La base giuridica è l’esecuzione del servizio e delle misure precontrattuali richieste.</p><p>I controlli su richieste ripetute e i registri di sicurezza tutelano il servizio da abusi, sulla base del legittimo interesse. Le segnalazioni di somiglianza sono valutate da una persona e non determinano automaticamente l’esclusione.</p><h2>Accesso e fornitori</h2><p>I materiali sono accessibili allo studente e al gestore autorizzato. Sono coinvolti i fornitori di hosting, database e invio email necessari al servizio. Fornitori e garanzie applicabili: {esc(site.cfg.get('PRIVACY_PROVIDERS'))}.</p><h2>Conservazione e diritti</h2><p>Criteri di conservazione: {esc(site.cfg.get('RETENTION_POLICY'))}. Puoi chiedere accesso, rettifica, cancellazione o limitazione, e opporti ai trattamenti fondati sul legittimo interesse, scrivendo al contatto indicato. Puoi proporre reclamo al Garante per la protezione dei dati personali.</p><h2>Cookie</h2><p>Utilizziamo soltanto il cookie tecnico di sessione necessario all’accesso e alla sicurezza dei moduli. Non usiamo cookie pubblicitari né strumenti di profilazione.</p>'''
  else:text=f'''<h1>Condizioni del servizio</h1><p>Il servizio FormaTesi è gestito da {business}. Contatto: {contact}.</p><h2>Supporto accademico</h2><p>Il servizio offre assistenza alla ricerca, revisione e organizzazione dell’elaborato. Lo studente deve rispettare le regole del proprio ateneo e rimane responsabile dell’elaborato presentato. Non sono garantiti voti, approvazioni o risultati di software di rilevazione.</p><h2>Prova e richieste</h2><p>È disponibile una sola prova per studente, previa verifica dei materiali e della disponibilità. Creare più account non dà diritto a ulteriori prove. I tempi vengono concordati in base alla richiesta.</p><h2>Proposte e revisioni</h2><p>Le proposte indicano ambito del lavoro, importo e revisioni incluse. Il pulsante “Conferma interesse” richiede un contatto per procedere e non conclude un acquisto né effettua pagamenti. Eventuali incarichi a pagamento sono definiti separatamente, con le informazioni contrattuali applicabili prima del pagamento.</p><h2>Materiali caricati</h2><p>Carica soltanto documenti che hai diritto di condividere. Evita informazioni personali non necessarie. Le revisioni vengono archiviate nella scheda del lavoro.</p>'''
