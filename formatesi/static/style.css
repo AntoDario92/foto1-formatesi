@@ -95,3 +95,28 @@ footer{font-size:15px}.contact-dock a{font-size:14px;min-width:138px}
 @media(max-width:380px){header .brand>span:not(.brand-icon){display:none}.hero h1{font-size:44px}.hero-visual{min-height:340px}.trust-line{grid-template-columns:1fr}.trust-line span:last-child{grid-column:auto}.graduation-main{min-height:660px}}
 .code-success{text-align:center}.practice-code{font:800 clamp(26px,7vw,42px)/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:3px;color:var(--blue);background:#fff5f8;border:2px dashed #d79aae;border-radius:16px;padding:22px;margin:28px 0;user-select:all}.code-success .notice{text-align:left}.auth-intro h1{overflow-wrap:anywhere}
 @media(max-width:600px){.practice-code{font-size:25px;letter-spacing:1.5px;padding:18px 10px}.auth-layout .panel{padding:24px 20px}}
+
+
+/* Maggiore leggibilità e testi in maiuscolo */
+html{font-size:18px}
+body{text-transform:uppercase}
+body,button,input,select,textarea{font-size:1rem}
+p,li,dd,summary,blockquote{line-height:1.7}
+label{font-size:1rem;font-weight:800;letter-spacing:.035em}
+input,select,textarea{min-height:58px;line-height:1.4;font-weight:650;letter-spacing:.025em;text-transform:uppercase}
+textarea{min-height:150px}
+button,.button,.secondary,.text-button,nav a,.auth-links a{font-weight:850;letter-spacing:.045em;text-transform:uppercase}
+.auth-layout .panel{font-size:1rem}
+.auth-layout .panel>form{gap:20px}
+.auth-layout .fine,.auth-links,.notice{font-size:.9rem;line-height:1.6}
+.auth-intro p{font-size:1.08rem;line-height:1.75}
+.check{font-size:.9rem;line-height:1.55}
+input::placeholder,textarea::placeholder{font-size:.92rem;font-weight:600;opacity:.78;text-transform:uppercase}
+@media(max-width:600px){
+ html{font-size:17px}
+ .auth-layout .panel{padding:28px 22px}
+ label{font-size:1rem}
+ input,select,textarea{font-size:1rem;min-height:56px}
+ .auth-links{gap:14px}
+ .auth-links a{font-size:.88rem}
+}
