@@ -16,10 +16,9 @@ class PublicRequest:
 
 
 def absolute_app_links(document):
-    for path in ("/registrati", "/login", "/anteprima"):
+    for path in ("/login", "/anteprima"):
         document = document.replace(f'href="{path}"', f'href="{BACKEND}{path}"')
-    wake = f"<script>fetch('{BACKEND}/health',{{mode:'no-cors'}}).catch(()=>{{}})</script>"
-    return document.replace("</body>", wake + "</body>")
+    return document
 
 
 def write_page(path, title, body):
@@ -33,6 +32,6 @@ if OUT.exists():
     shutil.rmtree(OUT)
 OUT.mkdir()
 shutil.copytree(ROOT / "static", OUT / "static")
-write_page(Path("."), "La tua tesi comincia a prendere forma", public_landing([]))
+write_page(Path("."), "La tua tesi comincia a prendere forma", public_landing([], False))
 write_page(Path("privacy"), "Privacy", legal(Site({}), "/privacy"))
 write_page(Path("condizioni"), "Condizioni del servizio", legal(Site({}), "/condizioni"))
