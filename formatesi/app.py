@@ -1,6 +1,9 @@
 """FormaTesi: WSGI application. PostgreSQL in production; SQLite only for local tests."""
 import base64, contextlib, datetime, hashlib, hmac, html, http.cookies, io, json, os, re, secrets, sqlite3, time, urllib.parse, urllib.request, uuid
 from pathlib import Path
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt
 
 ROOT=Path(__file__).parent
 FB='https://www.facebook.com/profile.php?id=61593221212687'
@@ -14,6 +17,11 @@ def uid(): return uuid.uuid4().hex
 def now(): return int(time.time())
 def digest(s): return hashlib.sha256(s.encode()).hexdigest()
 def normal(s): return ' '.join(re.sub(r'[^\w\s]',' ',s.lower()).split())
+def phone_number(value):
+ digits=re.sub(r'\D','',value or '')
+ if digits.startswith('00'):digits=digits[2:]
+ if len(digits)==10 and digits.startswith('3'):digits='39'+digits
+ return digits if re.fullmatch(r'\d{10,15}',digits) else ''
 def password_hash(s):
  salt=secrets.token_hex(16); return salt+':'+hashlib.scrypt(s.encode(),salt=salt.encode(),n=16384,r=8,p=1).hex()
 def password_ok(s,stored):
@@ -63,6 +71,12 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    if self.pg:username_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username'").fetchone()
    else:username_found=any(x['name']=='username' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
    if not username_found:self.run(c,'ALTER TABLE users ADD COLUMN username TEXT')
+   if self.pg:whatsapp_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='whatsapp'").fetchone()
+   else:whatsapp_found=any(x['name']=='whatsapp' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not whatsapp_found:self.run(c,'ALTER TABLE users ADD COLUMN whatsapp TEXT')
+   if self.pg:optin_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='whatsapp_opt_in'").fetchone()
+   else:optin_found=any(x['name']=='whatsapp_opt_in' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not optin_found:self.run(c,'ALTER TABLE users ADD COLUMN whatsapp_opt_in INTEGER NOT NULL DEFAULT 0')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
 
@@ -153,7 +167,7 @@ class Site:
  def page(self,r,title,body):
   if r.method=='POST':
    for key,value in r.data.items():
-    if key not in ['name','surname','matricola','email','faculty','subject','title','paragraph','outline','other_ateneo','body','description','amount','author','review_url','review_date','rating']:continue
+    if key not in ['name','surname','matricola','email','contact_email','username','whatsapp','faculty','subject','title','paragraph','outline','other_ateneo','body','description','amount','author','review_url','review_date','rating']:continue
     body=re.sub(r'(<input\b[^>]*name="'+re.escape(key)+r'"[^>]*)(>)',lambda m:m[1]+' value="'+esc(value)+'"'+m[2],body)
     body=re.sub(r'(<textarea\b[^>]*name="'+re.escape(key)+r'"[^>]*>)(.*?)(</textarea>)',lambda m:m[1]+esc(value)+m[3],body,flags=re.S)
    selected=r.data.get('ateneo','')
@@ -185,11 +199,15 @@ class Site:
   if p=='/logout' and r.method=='POST':
    self.mutate('DELETE FROM sessions WHERE id=?',(r.session['id'],));r.clear_cookie();return self.redirect('/')
   if p=='/area':return self.dashboard(r)
-  if p=='/account/email' and r.method=='POST':
+  if p in ['/account/email','/account/contatti'] and r.method=='POST':
    if r.user['role']=='admin':raise Failure('Azione non disponibile.',403)
    email=r.data.get('contact_email','').strip().lower()
    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Failure('Inserisci un indirizzo email valido.')
-   self.mutate('UPDATE users SET contact_email=? WHERE id=?',(email,r.user['id']))
+   whatsapp=phone_number(r.data.get('whatsapp',''))
+   opt_in=1 if r.data.get('whatsapp_opt_in')=='yes' else 0
+   if r.data.get('whatsapp','') and not whatsapp:raise Failure('Controlla il numero WhatsApp, includendo il prefisso internazionale.')
+   if opt_in and not whatsapp:raise Failure('Inserisci il numero WhatsApp per attivare gli avvisi.')
+   self.mutate('UPDATE users SET contact_email=?,whatsapp=?,whatsapp_opt_in=? WHERE id=?',(email,whatsapp or None,opt_in,r.user['id']))
    self.mail(email,'Notifiche FormaTesi attivate','Le notifiche del tuo account personale sono attive. Riceverai qui gli avvisi quando un lavoro o una revisione sarà disponibile.\n\nAccedi ai tuoi lavori: '+self.origin+'/login')
    return self.redirect('/area')
   if p=='/gestione/recensioni':return self.reviews_admin(r)
@@ -205,6 +223,8 @@ class Site:
    return data,200,[('Content-Type',f['mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(f['name']))]
   if p.startswith('/lavori/'):
    bits=p.strip('/').split('/');project=self.owned(r,bits[1]);action=bits[2] if len(bits)>2 else ''
+   if action=='riepilogo.docx':
+    r.admin();return self.project_summary_docx(project)
    if r.method=='POST':return self.project_action(r,project,action)
    return self.project_page(r,project)
   raise Failure('Pagina non trovata.',404)
@@ -353,6 +373,10 @@ class Site:
      if r.data.get('terms')!='yes':raise Failure('Leggi e accetta l’informativa per continuare.')
      contact=r.data.get('contact_email','').strip().lower()
      if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',contact):raise Failure('Inserisci un indirizzo email valido: serve per avvisarti quando il lavoro è pronto.')
+     whatsapp=phone_number(r.data.get('whatsapp',''))
+     opt_in=1 if r.data.get('whatsapp_opt_in')=='yes' else 0
+     if r.data.get('whatsapp','') and not whatsapp:raise Failure('Controlla il numero WhatsApp, includendo il prefisso internazionale.')
+     if opt_in and not whatsapp:raise Failure('Inserisci il numero WhatsApp per attivare gli avvisi.')
      username=r.data.get('username','').strip().lower()
      if username and not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,29}',username):raise Failure('Lo username deve avere da 3 a 30 caratteri e può contenere lettere, numeri, punto, trattino o trattino basso.')
      if username and self.query('SELECT id FROM users WHERE username=?',(username,),True):raise Failure('Questo username è già utilizzato. Scegline un altro.')
@@ -360,7 +384,7 @@ class Site:
       code='FT-'+secrets.token_hex(2).upper()+'-'+secrets.token_hex(2).upper()
       if not self.query('SELECT id FROM users WHERE matricola=?',(code,),True):break
      ident=uid();internal=code.lower()+'@pratica.invalid'
-     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email,username) VALUES(?,?,?,?,?,?,1,?,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact or None,username or None))
+     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email,username,whatsapp,whatsapp_opt_in) VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact,username or None,whatsapp or None,opt_in))
      user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);r.login(user);self.audit(user['id'],'code.registration')
      self.mail(contact,'Il tuo accesso personale FormaTesi','Conserva questo codice di accesso: '+code+'\n\nPer accedere ai tuoi lavori: '+self.origin+'/login')
      username_note=f'<p><strong>Username:</strong> {esc(username)}</p>' if username else ''
@@ -373,7 +397,7 @@ class Site:
     r.login(user);self.audit(user['id'],'code.login');return self.redirect('/area')
    except Failure as e:error=e.message
   if r.path=='/registrati':
-   fields=field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice di accesso.</p>'+field('contact_email','Email per ricevere gli avvisi','email',autocomplete='email',placeholder='La useremo per consegne e revisioni')+'<p class="fine">OBBLIGATORIA: QUI RICEVERAI LA CONFERMA DELLA RICHIESTA E L’AVVISO QUANDO IL LAVORO È PRONTO.</p>'+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa dell’account personale</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
+   fields=field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice di accesso.</p>'+field('contact_email','Email per ricevere gli avvisi','email',autocomplete='email',placeholder='La useremo per consegne e revisioni')+'<p class="fine">OBBLIGATORIA: QUI RICEVERAI LA CONFERMA DELLA RICHIESTA E L’AVVISO QUANDO IL LAVORO È PRONTO.</p>'+field('whatsapp','Numero WhatsApp (facoltativo)','tel',autocomplete='tel',required=False,placeholder='Es. +39 350 123 4567')+'<label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label>'+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa dell’account personale</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
    title='Crea il tuo account.<br>Accedi ai tuoi lavori.';intro='Riceverai un codice di accesso e le notifiche via email per ogni consegna o revisione.';label='Crea il mio account'
   else:
    fields=field('identifier','Codice di accesso o username','text',autocomplete='username',placeholder='FT-XXXX-XXXX oppure il tuo username')+field('password','Password','password',autocomplete='current-password')
@@ -393,6 +417,11 @@ class Site:
    if pending:mail=f'<div class="notice">{pending} notifiche email in attesa di invio.<form method="post" action="/gestione/email">{r.csrf()}<button class="text-button">Riprova gli invii</button></form></div>'
   elif not (r.user.get('contact_email') or (not r.user['email'].endswith('@pratica.invalid') and r.user['email'])):
    mail=f'<div class="notice"><strong>ATTIVA LE NOTIFICHE OBBLIGATORIE.</strong><p>Inserisci l’email sulla quale vuoi ricevere gli avvisi quando un lavoro è pronto.</p><form method="post" action="/account/email">{r.csrf()}{field("contact_email","Email per le notifiche","email",autocomplete="email")}<button class="button">Attiva le notifiche</button></form></div>'
+  if not admin:
+   current_email=r.user.get('contact_email') or (r.user['email'] if not r.user['email'].endswith('@pratica.invalid') else '')
+   checked=' checked' if r.user.get('whatsapp_opt_in') else ''
+   contacts=f'<details class="panel contact-settings"><summary>Gestisci email e WhatsApp</summary><form method="post" action="/account/contatti">{r.csrf()}<label>Email per le notifiche<input name="contact_email" type="email" required autocomplete="email" value="{esc(current_email)}"></label><label>Numero WhatsApp (facoltativo)<input name="whatsapp" type="tel" autocomplete="tel" value="{esc(r.user.get("whatsapp"))}" placeholder="Es. +39 350 123 4567"></label><label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"{checked}> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label><button class="button">Salva i contatti</button></form></details>'
+   mail+=contacts
   actions='<a class="button" href="/gestione/recensioni">Gestisci recensioni ↗</a>' if admin else '<a class="button" href="/nuovo">Richiedi un nuovo lavoro +</a>'
   body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
   return self.page(r,'I miei lavori' if not admin else 'Gestione lavori',body),200,[]
@@ -483,6 +512,30 @@ class Site:
   elif action=='richiedi-preventivo':self.notify_admin(updated,'Richiesta di preventivo FormaTesi','Lo studente desidera ricevere una proposta per continuare il lavoro.')
   elif action=='accetta':self.notify_admin(updated,'Proposta FormaTesi accettata','Lo studente ha confermato il proprio interesse per la proposta pubblicata.')
   return self.redirect('/lavori/'+p['id'])
+ def project_summary_docx(self,p):
+  student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True)
+  files=self.query('SELECT name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
+  doc=Document();section=doc.sections[0];section.page_width=Inches(8.5);section.page_height=Inches(11)
+  section.top_margin=section.bottom_margin=Inches(.75);section.left_margin=section.right_margin=Inches(.8)
+  styles=doc.styles;styles['Normal'].font.name='Aptos';styles['Normal'].font.size=Pt(11)
+  title=doc.add_paragraph();title.alignment=WD_ALIGN_PARAGRAPH.CENTER;title_run=title.add_run('Riepilogo lavoro FormaTesi');title_run.bold=True;title_run.font.size=Pt(26);title_run.font.color.rgb=None
+  subtitle=doc.add_paragraph('Scheda riservata al gestore');subtitle.alignment=WD_ALIGN_PARAGRAPH.CENTER
+  def section_table(heading,rows):
+   doc.add_heading(heading,level=1);table=doc.add_table(rows=0,cols=2);table.style='Table Grid'
+   for label,value in rows:
+    cells=table.add_row().cells;cells[0].text=label;cells[1].text=str('Non indicato' if value is None or value=='' else value);cells[0].paragraphs[0].runs[0].bold=True
+   doc.add_paragraph()
+  email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+  section_table('Studente e contatti',[('Codice di accesso',student['matricola']),('Username',student.get('username')),('Nome e cognome',(student['name']+' '+student['surname']) if student['name']!='Studente' else 'Non raccolti'),('Email',email),('WhatsApp',student.get('whatsapp')),('Consenso comunicazioni WhatsApp','Sì' if student.get('whatsapp_opt_in') else 'No')])
+  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
+  doc.add_heading('Indice o indicazioni iniziali',level=1);doc.add_paragraph(p['outline'] or 'Non inserito come testo.')
+  doc.add_heading('File caricati',level=1)
+  if files:
+   for item in files:doc.add_paragraph(item['name'],style='List Bullet')
+  else:doc.add_paragraph('Nessun file caricato.')
+  doc.add_paragraph('Documento generato dal pannello riservato FormaTesi.').italic=True
+  output=io.BytesIO();doc.save(output);data=output.getvalue();filename='riepilogo-formatesi-'+p['id'][:8]+'.docx'
+  return data,200,[('Content-Type','application/vnd.openxmlformats-officedocument.wordprocessingml.document'),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(filename))]
  def project_page(self,r,p):
   admin=r.user['role']=='admin';events=self.query('SELECT * FROM events WHERE project_id=? ORDER BY created,id',(p['id'],));files=self.query('SELECT id,event_id,name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
   quotes=self.query('SELECT * FROM quotes WHERE project_id=? ORDER BY created DESC',(p['id'],))
@@ -520,7 +573,13 @@ class Site:
   if admin:proposal+=f'<details class="panel"><summary>Prepara un preventivo</summary><form method="post" action="/lavori/{p["id"]}/preventivo">{r.csrf()}{field("amount","Importo complessivo in euro",extra="inputmode=decimal")}<label>Cosa comprende, tempi e revisioni incluse<textarea name="description" rows="6" required maxlength="10000"></textarea></label><button class="button">Invia la proposta</button></form></details>'
   elif not quotes:proposal+=f'<section class="panel"><h3>Vuoi proseguire insieme?</h3><p>Richiedi una proposta riferita al tuo progetto.</p><form method="post" action="/lavori/{p["id"]}/richiedi-preventivo">{r.csrf()}<button class="button">Richiedi preventivo</button></form></section>'
   contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
-  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside><section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
+  manager_contacts=''
+  if admin:
+   student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+   email_link=f'<a href="mailto:{esc(student_email)}">Scrivi via email ↗</a>' if student_email else '<span>Email non disponibile</span>'
+   whatsapp_link=f'<a href="https://wa.me/{esc(student.get("whatsapp"))}?text={urllib.parse.quote("Ciao, ti contatto da FormaTesi in merito al tuo lavoro.")}" target="_blank" rel="noopener">Scrivi su WhatsApp ↗</a>' if student.get('whatsapp') else '<span>WhatsApp non indicato</span>'
+   manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
 class Request:
@@ -640,7 +699,7 @@ def legal(site,path):
  if not site.ready:return '<section class="narrow panel"><span class="eyebrow">ANTEPRIMA FORMATESI</span><h1>'+('Privacy' if path=='/privacy' else 'Condizioni del servizio')+'</h1><p>L’area di registrazione non è ancora attiva e questa anteprima non raccoglie richieste o documenti degli studenti. Il sito non utilizza strumenti pubblicitari o di analisi del traffico. Il fornitore di hosting può trattare i dati tecnici necessari all’erogazione del sito.</p><p>Le informazioni complete sul titolare e sulle condizioni saranno pubblicate prima dell’apertura delle registrazioni.</p><a href="'+FB+'">Contatta FormaTesi</a></section>'
  if site.code_mode:
   contact=esc(site.cfg.get('PRIVACY_CONTACT') or site.cfg.get('ADMIN_EMAIL') or 'aiutotesidilaurea@proton.me')
-  if path=='/privacy':text=f'''<h1>Informativa dell’account personale</h1><p>Contatto per le richieste relative ai dati: {contact}.</p><h2>Dati ridotti al minimo</h2><p>L’account non richiede nome, cognome o matricola. Conserva il codice di accesso, la password in forma protetta, l’email necessaria alle notifiche, i dati accademici inseriti e gli eventuali materiali caricati. L’email viene usata per confermare le richieste e avvisare quando lavori o revisioni sono disponibili.</p><h2>Sicurezza e fornitori</h2><p>I servizi tecnici di hosting, database e invio email possono trattare i dati necessari al funzionamento e alla sicurezza. Non utilizziamo pubblicità, profilazione o analisi commerciali del traffico.</p><h2>Scelte dello studente</h2><p>Non inserire nomi, matricole, recapiti o altri dati personali nei titoli e nei documenti. Puoi chiedere accesso o cancellazione indicando il codice di accesso al contatto riportato sopra.</p><h2>Cookie</h2><p>Viene utilizzato soltanto il cookie tecnico necessario a mantenere l’accesso sicuro all’account.</p>'''
+  if path=='/privacy':text=f'''<h1>Informativa dell’account personale</h1><p>Contatto per le richieste relative ai dati: {contact}.</p><h2>Dati ridotti al minimo</h2><p>L’account non richiede nome, cognome o matricola. Conserva il codice di accesso, la password in forma protetta, l’email necessaria alle notifiche, i dati accademici inseriti e gli eventuali materiali caricati. L’email viene usata per confermare le richieste e avvisare quando lavori o revisioni sono disponibili. Il numero WhatsApp è facoltativo e viene usato per comunicazioni sui lavori soltanto con il consenso dello studente, revocabile dall’account personale.</p><h2>Sicurezza e fornitori</h2><p>I servizi tecnici di hosting, database e invio email possono trattare i dati necessari al funzionamento e alla sicurezza. Non utilizziamo pubblicità, profilazione o analisi commerciali del traffico.</p><h2>Scelte dello studente</h2><p>Non inserire nomi, matricole, recapiti o altri dati personali nei titoli e nei documenti. Puoi chiedere accesso o cancellazione indicando il codice di accesso al contatto riportato sopra.</p><h2>Cookie</h2><p>Viene utilizzato soltanto il cookie tecnico necessario a mantenere l’accesso sicuro all’account.</p>'''
   else:text='''<h1>Condizioni dell’account personale</h1><p>FormaTesi offre supporto alla ricerca, alla revisione e all’organizzazione dell’elaborato. Lo studente rimane responsabile del lavoro presentato e del rispetto delle regole del proprio ateneo.</p><h2>Prova gratuita</h2><p>La prova viene valutata in base ai materiali e alla disponibilità. Il codice di accesso deve essere conservato: insieme alla password consente di consultare lo stato, le consegne e le revisioni.</p><h2>Notifiche</h2><p>È necessario fornire un indirizzo email valido per ricevere la conferma delle richieste e gli avvisi di consegna o revisione.</p><h2>Materiali</h2><p>È vietato caricare frontespizi o file contenenti nome, matricola, firme, documenti di identità o dati personali non necessari. Non sono garantiti voti, approvazioni o risultati di software di rilevazione.</p>'''
   return '<section class="narrow panel legal">'+text+'</section>'
  business=esc(site.cfg.get('BUSINESS_NAME'));contact=esc(site.cfg.get('PRIVACY_CONTACT'))
