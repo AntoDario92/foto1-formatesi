@@ -2,7 +2,7 @@
 import shutil
 from pathlib import Path
 
-from app import Site, legal, public_landing
+from app import ATENEI_PAGES, Site, legal, public_landing, university_page
 
 ROOT = Path(__file__).parent
 OUT = ROOT / "static_public"
@@ -44,3 +44,5 @@ shutil.copytree(ROOT / "static", OUT / "static")
 write_page(Path("."), "La tua tesi comincia a prendere forma", public_landing([], True))
 write_page(Path("privacy"), "Privacy", legal(Site({}), "/privacy"))
 write_page(Path("condizioni"), "Condizioni del servizio", legal(Site({}), "/condizioni"))
+for slug, name in ATENEI_PAGES.items():
+    write_page(Path("atenei") / slug, "Supporto tesi " + name, university_page(slug, True))
