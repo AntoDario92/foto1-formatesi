@@ -58,7 +58,9 @@ class PortalTests(unittest.TestCase):
   self.assertIn('quelle precedenti',revised['body'])
  def test_manager_contacts_and_word_summary(self):
   self.app.mutate('UPDATE users SET contact_email=?,whatsapp=?,whatsapp_opt_in=1 WHERE email=?',('a@example.com','393501234567','a@example.com'))
-  url=self.new();self.admin.call(url)
+  url=self.new();self.admin.call('/area')
+  self.assertIn('Studente: a',self.admin.body);self.assertIn('Codice: a',self.admin.body);self.assertIn('a@example.com',self.admin.body);self.assertIn('393501234567',self.admin.body)
+  self.admin.call(url)
   self.assertIn('CONTATTI DELLO STUDENTE',self.admin.body);self.assertIn('mailto:a@example.com',self.admin.body);self.assertIn('wa.me/393501234567',self.admin.body);self.assertIn('Scarica riepilogo Word',self.admin.body)
   self.assertEqual(self.student.call(url+'/riepilogo.docx'),403)
   self.admin.call(url);self.assertEqual(self.admin.call(url+'/riepilogo.docx'),200)
