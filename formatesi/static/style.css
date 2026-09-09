@@ -122,3 +122,50 @@ input::placeholder,textarea::placeholder{font-size:.92rem;font-weight:600;opacit
  .auth-links{gap:14px}
  .auth-links a{font-size:.88rem}
 }
+
+/* Sfondo accademico, logo integro e ottimizzazione responsive */
+body{position:relative;isolation:isolate;overflow-x:hidden;background:#fff}
+body:before{content:'';position:fixed;inset:96px 0 0;z-index:-2;background:linear-gradient(rgba(255,255,255,.9),rgba(255,255,255,.94)),url('/static/tesi-laurea-formatesi.webp') center 32%/cover no-repeat;opacity:.72;pointer-events:none}
+main{position:relative}
+.brand-icon{width:48px;height:48px;flex:0 0 48px;border-radius:11px;background:#07152e;padding:2px;overflow:hidden;box-shadow:0 5px 16px rgba(7,21,46,.18)}
+.brand-icon img{display:block;width:100%;height:100%;object-fit:contain;object-position:center;transform:none}
+p,li,dd,summary,blockquote{color:#4c5870}
+.panel,.project-card,.stats,.auth-layout .panel,.narrow{background:rgba(255,255,255,.97);box-shadow:0 16px 44px rgba(7,21,46,.06)}
+input,select,textarea{font-size:17px;color:#101b38;background:#fff;border-width:2px}
+input:focus,select:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 4px rgba(194,13,77,.1);outline:0}
+.fine,.project-info p,.project-meta .fine,dt,.event-heading time{font-size:14px}
+
+@media(max-width:1000px){
+ header{padding-inline:4%}
+ .hero{grid-template-columns:1fr;padding-top:48px}
+ .hero-copy{max-width:760px}
+ .hero-visual{width:100%;max-width:720px;margin:auto;min-height:520px;background-size:contain;background-repeat:no-repeat}
+ .feature-section,.faq,.form-layout,.detail-layout{grid-template-columns:1fr}
+ .form-layout aside{position:static}
+ .stats{grid-template-columns:repeat(2,1fr);gap:22px 0}
+ .stats>div:nth-child(2){border-right:0}
+ .project-card{align-items:flex-start}
+}
+@media(max-width:760px){
+ body:before{position:absolute;inset:76px 0 0;background-position:62% top;opacity:.58}
+ header{min-height:76px;height:auto;padding-top:8px;padding-bottom:8px}
+ .brand{font-size:21px;letter-spacing:-.7px}.brand-icon{width:42px;height:42px;flex-basis:42px;margin-right:8px}
+ nav{margin-left:auto}.button.small{white-space:normal;max-width:150px}
+ .hero-visual{min-height:360px;background-size:contain}
+ .panel,.narrow{border-radius:14px;box-shadow:0 10px 30px rgba(7,21,46,.07)}
+ .grid.two{grid-template-columns:1fr;gap:0}
+ label{margin-bottom:22px}
+ input,select,textarea{font-size:16px;min-height:56px;padding:14px}
+ .page-heading h1,.auth-intro h1,.narrow h1{font-size:clamp(32px,10vw,42px);line-height:1.12;letter-spacing:-1px}
+ .stats{grid-template-columns:1fr 1fr}.stats>div{border-right:0;border-bottom:1px solid var(--line);padding-bottom:14px}.stats>div:nth-last-child(-n+2){border-bottom:0}
+ .project-card{display:block}.project-info{padding-right:28px}.project-meta{margin-top:15px}
+ .contact-dock{padding-bottom:env(safe-area-inset-bottom)}
+}
+@media(max-width:420px){
+ header .brand>span:not(.brand-icon){display:none}
+ header nav .button.small{max-width:132px;font-size:12px;padding:9px 10px}
+ .hero{padding-inline:4.5%}.hero-visual{min-height:310px}
+ .workspace,.auth-layout{padding-inline:4%}
+ .panel,.narrow{padding:22px 17px}
+ .stats{padding:16px 8px}.stats strong{font-size:25px}
+}
