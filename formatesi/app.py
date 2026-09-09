@@ -1,9 +1,12 @@
 """FormaTesi: WSGI application. PostgreSQL in production; SQLite only for local tests."""
 import base64, contextlib, datetime, hashlib, hmac, html, http.cookies, io, json, os, re, secrets, sqlite3, time, urllib.parse, urllib.request, uuid
 from pathlib import Path
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches, Pt
+try:
+ from docx import Document
+ from docx.enum.text import WD_ALIGN_PARAGRAPH
+ from docx.shared import Inches, Pt
+except ImportError:  # L'esportazione del sito pubblico non genera documenti Word.
+ Document=WD_ALIGN_PARAGRAPH=Inches=Pt=None
 
 ROOT=Path(__file__).parent
 FB='https://www.facebook.com/profile.php?id=61593221212687'
