@@ -89,7 +89,7 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(c.post('/registrati-facebook',ticket=ticket,matricola='M-998',terms='yes'),303)
   user=self.app.query('SELECT * FROM users WHERE email=?',('lucia@example.com',),True)
   self.assertEqual(user['facebook_id'],'fb-44');self.assertEqual(user['matricola'],'M-998');self.assertEqual(user['verified'],1)
-  c.call('/area');self.assertIn('Ciao, Lucia',c.body)
+  c.call('/area');self.assertIn('I miei lavori.',c.body);self.assertNotIn('ATTIVA LE NOTIFICHE',c.body)
   bad=Client(self.app);bad.call('/registrati-facebook?ticket='+urllib.parse.quote(ticket+'x'));self.assertIn('scaduta',bad.body)
  def test_verified_facebook_reviews(self):
   self.admin.call('/area');self.assertIn('Gestisci recensioni',self.admin.body)
@@ -100,13 +100,17 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(self.admin.post('/gestione/recensioni',author='Giulia <Test>',body='Servizio preciso & puntuale',rating='5',review_date='2026-09-05',review_url='https://www.facebook.com/example/reviews/123'),303)
   public=Client(self.app);self.assertEqual(public.call('/'),200)
   self.assertIn('Servizio preciso &amp; puntuale',public.body);self.assertIn('Giulia &lt;Test&gt;',public.body);self.assertIn('Recensione originale su Facebook',public.body)
- def test_portale_con_codice_senza_dati_anagrafici(self):
+ def test_portale_con_codice_senza_dati_anagrafici_ma_con_email_notifiche(self):
   app=Site({'TESTING':'1','TEST_DB':self.tmp.name+'/code.sqlite','ADMIN_EMAIL':'owner@example.com','CODE_PORTAL':'yes'})
   c=Client(app);self.assertEqual(c.call('/registrati'),200)
   self.assertEqual(c.post('/registrati',contact_email='',password='Una password anonima 123',terms='yes'),200)
+  self.assertIn('serve per avvisarti',c.body);self.assertIsNone(app.query("SELECT * FROM users WHERE email LIKE '%@pratica.invalid'",one=True))
+  self.assertEqual(c.post('/registrati',contact_email='avvisi@example.com',password='Una password anonima 123',terms='yes'),200)
   user=app.query("SELECT * FROM users WHERE email LIKE '%@pratica.invalid'",one=True)
-  self.assertTrue(user['matricola'].startswith('FT-'));self.assertEqual(user['name'],'Studente');self.assertIsNone(user['contact_email'])
+  self.assertTrue(user['matricola'].startswith('FT-'));self.assertEqual(user['name'],'Studente');self.assertEqual(user['contact_email'],'avvisi@example.com')
   self.assertNotIn('matricola universitaria',c.body.lower());self.assertIn(user['matricola'],c.body)
+  notice=app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('avvisi@example.com','Il tuo accesso personale FormaTesi'),True)
+  self.assertIn('accedere ai tuoi lavori',notice['body'])
   c.call('/logout',{'csrf':c.csrf});c.call('/login')
   self.assertEqual(c.post('/login',identifier=user['matricola'],password='Una password anonima 123'),303)
   self.assertEqual(c.call('/area'),200)
