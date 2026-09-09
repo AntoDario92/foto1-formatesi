@@ -19,6 +19,7 @@ SOCIAL_ICONS={
  'whatsapp':'<svg class="social-svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.04 2a9.84 9.84 0 0 0-8.52 14.76L2 22l5.38-1.41A9.95 9.95 0 1 0 12.04 2zm5.79 14.05c-.25.7-1.45 1.34-2 1.42-.51.08-1.16.11-1.87-.12-.43-.14-.98-.32-1.69-.63-2.97-1.28-4.9-4.27-5.05-4.47-.15-.2-1.21-1.61-1.21-3.07s.77-2.18 1.04-2.48c.27-.3.59-.37.79-.37h.57c.18.01.43-.07.67.51.25.6.84 2.05.91 2.2.08.15.13.32.03.52-.1.2-.15.32-.3.49-.15.17-.31.37-.45.49-.15.15-.3.31-.13.61.17.3.75 1.23 1.61 1.99 1.11.99 2.04 1.3 2.34 1.45.3.15.47.13.64-.08.17-.2.74-.86.94-1.16.2-.3.4-.25.67-.15.27.1 1.73.82 2.03.97.3.15.49.22.57.34.07.13.07.72-.18 1.42z"/></svg>'
 }
 ATENEI=['eCampus','Pegaso','Universitas Mercatorum','San Raffaele Roma','UnitelmaSapienza','Università Guglielmo Marconi','Università Niccolò Cusano','UNINETTUNO','IUL Università Telematica','Università Giustino Fortunato','Università di Roma La Sapienza','Università Federico II di Napoli','Università di Bologna','Università di Palermo','Università di Catania','Università degli Studi di Milano','Università di Torino','Altro ateneo']
+ATENEI_PAGES={'ecampus':'eCampus','pegaso':'Pegaso','mercatorum':'Universitas Mercatorum','san-raffaele':'San Raffaele Roma','unitelma':'UnitelmaSapienza','marconi':'Università Guglielmo Marconi','unicusano':'Università Niccolò Cusano','uninettuno':'UNINETTUNO'}
 STATUS={'waiting':'In attesa','delivered':'Consegnato','revision_requested':'Da revisionare','revised':'Revisionato'}
 def esc(s): return html.escape(str(s or ''),quote=True)
 def uid(): return uuid.uuid4().hex
@@ -85,6 +86,16 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    if self.pg:optin_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='whatsapp_opt_in'").fetchone()
    else:optin_found=any(x['name']=='whatsapp_opt_in' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
    if not optin_found:self.run(c,'ALTER TABLE users ADD COLUMN whatsapp_opt_in INTEGER NOT NULL DEFAULT 0')
+   def add_column(table,column,declaration):
+    if self.pg:found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?",(table,column)).fetchone()
+    else:found=any(x['name']==column for x in self.run(c,'PRAGMA table_info('+table+')').fetchall())
+    if not found:self.run(c,'ALTER TABLE '+table+' ADD COLUMN '+column+' '+declaration)
+   add_column('projects','priority',"TEXT NOT NULL DEFAULT 'normal'")
+   add_column('projects','due_at','BIGINT')
+   add_column('projects','manager_note','TEXT')
+   add_column('outbox','attempts','INTEGER NOT NULL DEFAULT 0')
+   add_column('outbox','last_error','TEXT')
+   add_column('outbox','sent_at','BIGINT')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
 
@@ -121,7 +132,7 @@ class Site:
    r=self.db.run(c,'SELECT count FROM rate_limits WHERE key=?',(key,)).fetchone()
    if r['count']>maximum:raise Failure('Troppi tentativi. Riprova tra qualche minuto.',429)
  def mail(self,email,subject,body):
-  ident=uid();self.mutate('INSERT INTO outbox VALUES(?,?,?,?,0,?)',(ident,email,subject,body,now()))
+  ident=uid();self.mutate('INSERT INTO outbox(id,email,subject,body,sent,created,attempts,last_error,sent_at) VALUES(?,?,?,?,0,?,0,NULL,NULL)',(ident,email,subject,body,now()))
   if self.testing:return
   self.send_mail(ident,email,subject,body)
  def send_mail(self,ident,email,subject,body):
@@ -134,8 +145,9 @@ class Site:
    req=urllib.request.Request('https://api.brevo.com/v3/smtp/email',data=payload,headers={'api-key':self.cfg['BREVO_API_KEY'],'Accept':'application/json','Content-Type':'application/json'})
    with urllib.request.urlopen(req,timeout=8) as response:
     if response.status not in (200,201):return
-   self.mutate('UPDATE outbox SET sent=1,body=? WHERE id=?',('[Messaggio inviato]',ident))
-  except Exception:
+   self.mutate('UPDATE outbox SET sent=1,body=?,attempts=attempts+1,last_error=NULL,sent_at=? WHERE id=?',('[Messaggio inviato]',now(),ident))
+  except Exception as exc:
+   self.mutate('UPDATE outbox SET attempts=attempts+1,last_error=? WHERE id=?',(str(exc)[:500],ident))
    import logging;logging.exception('Email FormaTesi non inviata') # Retained outbox permits an explicit admin retry without losing deliveries.
  def token(self,user,kind):
   raw=secrets.token_urlsafe(32)
@@ -195,6 +207,10 @@ class Site:
   if p=='/health':return json.dumps({'status':'ok','portal': 'active' if self.ready else 'setup_required'}),200,[('Content-Type','application/json')]
   if p=='/robots.txt':return 'User-agent: *\nDisallow: /area\nDisallow: /lavori/\nDisallow: /gestione\nDisallow: /verifica\nDisallow: /reimposta\n',200,[('Content-Type','text/plain')]
   if p=='/':return self.page(r,'La tua tesi comincia a prendere forma',public_landing(self.public_reviews(),self.ready)),200,[]
+  if p.startswith('/atenei/'):
+   slug=p.strip('/').split('/')[-1]
+   if slug not in ATENEI_PAGES:raise Failure('Ateneo non trovato.',404)
+   return self.page(r,'Supporto tesi '+ATENEI_PAGES[slug],university_page(slug,self.ready)),200,[]
   if p=='/anteprima':return self.page(r,'Anteprima area personale',demo()),200,[]
   if p in ['/privacy','/condizioni']:return self.page(r,'Informazioni',legal(self,p)),200,[]
   if not self.ready:return self.closed(r)
@@ -219,6 +235,7 @@ class Site:
    self.mail(email,'Notifiche FormaTesi attivate','Le notifiche del tuo account personale sono attive. Riceverai qui gli avvisi quando un lavoro o una revisione sarà disponibile.\n\nAccedi ai tuoi lavori: '+self.origin+'/login')
    return self.redirect('/area')
   if p=='/gestione/recensioni':return self.reviews_admin(r)
+  if p=='/gestione/notifiche':return self.notifications_admin(r)
   if p=='/nuovo':return self.new_project(r)
   if p=='/gestione/email' and r.method=='POST':
    r.admin()
@@ -236,6 +253,24 @@ class Site:
    if r.method=='POST':return self.project_action(r,project,action)
    return self.project_page(r,project)
   raise Failure('Pagina non trovata.',404)
+ def notifications_admin(self,r):
+  r.admin()
+  if r.method=='POST':
+   message=self.query('SELECT * FROM outbox WHERE id=?',(r.data.get('notification'),),True)
+   if not message:raise Failure('Notifica non trovata.',404)
+   self.send_mail(message['id'],message['email'],message['subject'],message['body'])
+   return self.redirect('/gestione/notifiche')
+  rows=self.query('SELECT * FROM outbox ORDER BY created DESC LIMIT 100')
+  sent=sum(bool(x['sent']) for x in rows);pending=sum(not x['sent'] for x in rows)
+  cards=''
+  for item in rows:
+   state='<span class="badge success">Inviata</span>' if item['sent'] else '<span class="badge waiting">Da riprovare</span>'
+   retry='' if item['sent'] else f'<form method="post">{r.csrf()}<input type="hidden" name="notification" value="{item["id"]}"><button class="button small">Riprova invio</button></form>'
+   error=f'<p class="notification-error">{esc(item.get("last_error"))}</p>' if item.get('last_error') else ''
+   cards+=f'<article class="notification-card"><div><strong>{esc(item["subject"])}</strong>{state}</div><p>{esc(item["email"])}</p><small>Creata: {date(item["created"])} · Tentativi: {item.get("attempts") or 0}</small>{error}{retry}</article>'
+  if not cards:cards='<div class="empty compact"><p>Nessuna notifica registrata.</p></div>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Torna al pannello</a><div class="page-heading"><div><span class="eyebrow">CONTROLLO COMUNICAZIONI</span><h1>Notifiche email.</h1><p>Verifica consegne riuscite ed eventuali invii da ripetere.</p></div></div><div class="stats compact-stats"><div><strong>{sent}</strong><span>Inviate</span></div><div><strong>{pending}</strong><span>Da riprovare</span></div></div><div class="notification-list">{cards}</div></section>'
+  return self.page(r,'Notifiche email',body),200,[]
  def public_reviews(self):
   if not self.db:return []
   return self.query('SELECT * FROM reviews WHERE published=1 ORDER BY review_date DESC,created DESC LIMIT 6')
@@ -296,7 +331,7 @@ class Site:
   return project
  def auth(self,r):
   p=r.path;error='';message=''
-  if self.code_mode and p in ['/registrati','/login']:return self.code_auth(r)
+  if self.code_mode and p in ['/registrati','/login','/recupera']:return self.code_auth(r)
   if p=='/verifica':
    token=self.query('SELECT * FROM tokens WHERE id=? AND kind=? AND expires>?',(digest(r.q.get('token','')),'verify',now()),True)
    if not token:raise Failure('Link scaduto o già utilizzato. Puoi richiederne un altro dalla pagina di accesso.')
@@ -375,6 +410,13 @@ class Site:
   if r.method=='POST':
    self.limit('code-auth:'+r.ip,20,3600)
    try:
+    if r.path=='/recupera':
+     identifier=r.data.get('identifier','').strip()
+     user=self.query('SELECT * FROM users WHERE matricola=? OR username=? OR contact_email=?',(identifier.upper(),identifier.lower(),identifier.lower()),True)
+     if user and user.get('contact_email'):
+      raw=self.token(user,'reset');self.mail(user['contact_email'],'Reimposta la password FormaTesi','Apri questo collegamento entro un’ora per scegliere una nuova password: '+self.origin+'/reimposta?token='+raw)
+     body='<section class="narrow panel"><span class="eyebrow">RECUPERO ACCESSO</span><h1>Controlla la tua email.</h1><p>Se i dati inseriti corrispondono a un account, riceverai il collegamento per scegliere una nuova password.</p><a class="button" href="/login">Torna all’accesso</a></section>'
+     return self.page(r,'Recupera accesso',body),200,[]
     password=r.password()
     if r.path=='/registrati':
      self.limit('code-register:'+r.ip,5,3600)
@@ -405,16 +447,24 @@ class Site:
     r.login(user);self.audit(user['id'],'code.login');return self.redirect('/area')
    except Failure as e:error=e.message
   if r.path=='/registrati':
-   fields=field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice di accesso.</p>'+field('contact_email','Email per ricevere gli avvisi','email',autocomplete='email',placeholder='La useremo per consegne e revisioni')+'<p class="fine">OBBLIGATORIA: QUI RICEVERAI LA CONFERMA DELLA RICHIESTA E L’AVVISO QUANDO IL LAVORO È PRONTO.</p>'+field('whatsapp','Numero WhatsApp (facoltativo)','tel',autocomplete='tel',required=False,placeholder='Es. +39 350 123 4567')+'<label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label>'+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire nome, matricola o altri dati personali nella password.</p><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa dell’account personale</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label>'
+   fields='<div class="wizard-progress" aria-label="Avanzamento registrazione"><span class="active">1 · ACCESSO</span><span>2 · CONTATTI</span><span>3 · CONFERMA</span></div><div class="wizard-step" data-step="1"><h2>Scegli come rientrare</h2>'+field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice di accesso generato automaticamente.</p>'+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire dati personali nella password.</p><button class="button full wizard-next" type="button">Continua ai contatti ↗</button></div><div class="wizard-step" data-step="2"><h2>Dove ricevere gli avvisi</h2>'+field('contact_email','Email per ricevere gli avvisi','email',autocomplete='email',placeholder='La useremo per consegne e revisioni')+'<p class="fine">OBBLIGATORIA: QUI RICEVERAI LA CONFERMA E L’AVVISO QUANDO IL LAVORO È PRONTO.</p>'+field('whatsapp','Numero WhatsApp (facoltativo)','tel',autocomplete='tel',required=False,placeholder='Es. +39 350 123 4567')+'<label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label><div class="wizard-actions"><button class="button secondary wizard-back" type="button">Indietro</button><button class="button wizard-next" type="button">Continua ↗</button></div></div><div class="wizard-step" data-step="3"><h2>Conferma il tuo account</h2><div class="confirmation-card"><strong>Nessun pagamento</strong><p>Creeremo il tuo spazio personale e ti mostreremo subito il codice da conservare.</p></div><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa dell’account personale</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label><div class="wizard-actions"><button class="button secondary wizard-back" type="button">Indietro</button><button class="button">Crea il mio account ↗</button></div></div>'
    title='Crea il tuo account.<br>Accedi ai tuoi lavori.';intro='Riceverai un codice di accesso e le notifiche via email per ogni consegna o revisione.';label='Crea il mio account'
-  else:
+  elif r.path=='/login':
    fields=field('identifier','Codice di accesso o username','text',autocomplete='username',placeholder='FT-XXXX-XXXX oppure il tuo username')+field('password','Password','password',autocomplete='current-password')
    title='Accedi ai<br>tuoi lavori.';intro='Inserisci il codice di accesso oppure lo username, poi la password.';label='Accedi ai miei lavori'
-  body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">ACCOUNT PERSONALE</span><h1>{title}</h1><p>{intro}</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+f'<form method="post">{r.csrf()}{fields}<button class="button full">{label} ↗</button></form><div class="auth-links"><a href="/login">Accedi ai miei lavori</a><a href="/registrati">Crea il mio account</a></div></div></section>'
+  else:
+   fields=field('identifier','Codice, username o email per gli avvisi','text',autocomplete='username',placeholder='Inserisci uno dei dati collegati al tuo account')
+   title='Recupera il tuo<br>accesso.';intro='Ti invieremo un collegamento sicuro all’email associata all’account.';label='Invia il collegamento'
+  submit='' if r.path=='/registrati' else f'<button class="button full">{label} ↗</button>'
+  wizard=' data-wizard' if r.path=='/registrati' else ''
+  body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">ACCOUNT PERSONALE</span><h1>{title}</h1><p>{intro}</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+f'<form method="post"{wizard}>{r.csrf()}{fields}{submit}</form><div class="auth-links"><a href="/login">Accedi ai miei lavori</a><a href="/registrati">Crea il mio account</a><a href="/recupera">Password dimenticata?</a></div></div></section>'
   return self.page(r,label,body),200,[]
  def dashboard(self,r):
   admin=r.user['role']=='admin';status=r.q.get('stato','');search=r.q.get('q','').strip()
   projects=self.query('SELECT p.*,u.name,u.surname,u.email,u.contact_email,u.username,u.matricola,u.whatsapp FROM projects p JOIN users u ON u.id=p.user_id '+('' if admin else 'WHERE p.user_id=? ')+'ORDER BY p.updated DESC',() if admin else (r.user['id'],))
+  if admin:
+   rank={'urgent':0,'high':1,'normal':2}
+   projects.sort(key=lambda p:(rank.get(p.get('priority'),2),p.get('due_at') or 9999999999,-p['updated']))
   counts={k:sum(p['status']==k for p in projects) for k in STATUS}
   filtered=[p for p in projects if (not status or p['status']==status) and (not search or normal(search) in normal(' '.join(str(p.get(k) or '') for k in ['title','name','surname','ateneo','username','matricola','contact_email','whatsapp'])))]
   cards=''.join(project_card(p,admin) for p in filtered) or '<div class="empty"><span class="empty-icon">↗</span><h2>'+('Nessun lavoro trovato.' if search or status else 'Il tuo prossimo passo comincia qui.')+'</h2><p>'+('Prova a cambiare i filtri.' if search or status else 'Raccontaci la tua tesi per richiedere il primo lavoro.')+'</p>'+('' if admin else '<a class="button" href="/nuovo">Crea la tua richiesta</a>')+'</div>'
@@ -430,8 +480,15 @@ class Site:
    checked=' checked' if r.user.get('whatsapp_opt_in') else ''
    contacts=f'<details class="panel contact-settings"><summary>Gestisci email e WhatsApp</summary><form method="post" action="/account/contatti">{r.csrf()}<label>Email per le notifiche<input name="contact_email" type="email" required autocomplete="email" value="{esc(current_email)}"></label><label>Numero WhatsApp (facoltativo)<input name="whatsapp" type="tel" autocomplete="tel" value="{esc(r.user.get("whatsapp"))}" placeholder="Es. +39 350 123 4567"></label><label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"{checked}> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label><button class="button">Salva i contatti</button></form></details>'
    mail+=contacts
-  actions='<a class="button" href="/gestione/recensioni">Gestisci recensioni ↗</a>' if admin else '<a class="button" href="/nuovo">Richiedi un nuovo lavoro +</a>'
-  body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
+  actions='<div class="admin-actions"><a class="button" href="/gestione/notifiche">Controlla notifiche</a><a class="button secondary" href="/gestione/recensioni">Gestisci recensioni</a></div>' if admin else '<a class="button" href="/nuovo">Richiedi un nuovo lavoro +</a>'
+  insights=''
+  if admin:
+   students=self.query("SELECT COUNT(*) AS n FROM users WHERE role='student'",one=True)['n']
+   deliveries=self.query("SELECT COUNT(*) AS n FROM events WHERE kind='delivery'",one=True)['n']
+   accepted=self.query("SELECT COUNT(*) AS n FROM quotes WHERE status='accepted'",one=True)['n']
+   urgent=sum(p.get('priority')=='urgent' for p in projects)
+   insights=f'<section class="manager-overview"><div><strong>{students}</strong><span>Account studenti</span></div><div><strong>{len(projects)}</strong><span>Richieste ricevute</span></div><div><strong>{deliveries}</strong><span>Consegne pubblicate</span></div><div><strong>{accepted}</strong><span>Proposte accettate</span></div><div class="urgent-metric"><strong>{urgent}</strong><span>Lavori urgenti</span></div></section>'
+  body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}{insights}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
   return self.page(r,'I miei lavori' if not admin else 'Gestione lavori',body),200,[]
  def new_project(self,r):
   error=''
@@ -450,7 +507,7 @@ class Site:
     if used and r.data.get('paid')!='yes':raise Failure('Hai già richiesto la prova gratuita. Puoi inviare una richiesta di preventivo.')
     ident=uid();identity=digest(normal(ateneo)+'|'+normal(r.user['matricola']))
     with self.db.connect() as c:
-     self.db.run(c,'INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now()))
+     self.db.run(c,'INSERT INTO projects(id,user_id,ateneo,faculty,subject,title,outline,paragraph,status,revision,free,identity_key,created,updated) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now()))
      if attachment:self.save_file(c,ident,None,attachment)
     self.audit(r.user['id'],'project.created:'+ident)
     project=self.query('SELECT * FROM projects WHERE id=?',(ident,),True)
@@ -467,8 +524,8 @@ class Site:
  def save_file(self,c,project,event,attachment):
   name,mime,data=attachment;self.db.run(c,'INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(uid(),project,event,name,mime,base64.b64encode(data).decode(),hashlib.sha256(data).hexdigest(),now()))
  def project_action(self,r,p,action):
-  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo']:raise Failure('Azione non valida.',404)
-  if action in ['consegna','preventivo']:r.admin()
+  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza']:raise Failure('Azione non valida.',404)
+  if action in ['consegna','preventivo','organizza']:r.admin()
   elif r.user['id']!=p['user_id']:raise Failure('Questa azione è riservata allo studente.',403)
   if action=='consegna':
    recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
@@ -510,6 +567,16 @@ class Site:
     if not changed:raise Failure('La proposta è già stata aggiornata. Ricarica la pagina.',409)
    elif action=='richiedi-preventivo':
     if not self.db.run(c,'SELECT id FROM events WHERE project_id=? AND kind=?',(p['id'],'quote_request')).fetchone():self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'quote_request','Richiesto un preventivo per proseguire.',p['revision'],now()))
+   elif action=='organizza':
+    priority=r.data.get('priority','normal')
+    if priority not in ['normal','high','urgent']:raise Failure('Priorità non valida.')
+    due_at=None
+    if r.data.get('due_date'):
+     try:due_at=int(datetime.datetime.strptime(r.data['due_date'],'%Y-%m-%d').replace(tzinfo=datetime.timezone.utc).timestamp())
+     except ValueError:raise Failure('Controlla la data di scadenza.')
+    note=r.data.get('manager_note','').strip()
+    if len(note)>2000:raise Failure('La nota interna è troppo lunga.')
+    self.db.run(c,'UPDATE projects SET priority=?,due_at=?,manager_note=?,updated=? WHERE id=?',(priority,due_at,note,now(),p['id']))
   self.audit(r.user['id'],action+':'+p['id'])
   updated=self.query('SELECT * FROM projects WHERE id=?',(p['id'],),True)
   if action=='consegna':
@@ -535,7 +602,7 @@ class Site:
    doc.add_paragraph()
   email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
   section_table('Studente e contatti',[('Codice di accesso',student['matricola']),('Username',student.get('username')),('Nome e cognome',(student['name']+' '+student['surname']) if student['name']!='Studente' else 'Non raccolti'),('Email',email),('WhatsApp',student.get('whatsapp')),('Consenso comunicazioni WhatsApp','Sì' if student.get('whatsapp_opt_in') else 'No')])
-  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
+  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Priorità',{'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')),('Scadenza interna',date(p['due_at']) if p.get('due_at') else 'Non impostata'),('Nota riservata al gestore',p.get('manager_note')),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
   doc.add_heading('Indice o indicazioni iniziali',level=1);doc.add_paragraph(p['outline'] or 'Non inserito come testo.')
   doc.add_heading('File caricati',level=1)
   if files:
@@ -582,12 +649,16 @@ class Site:
   elif not quotes:proposal+=f'<section class="panel"><h3>Vuoi proseguire insieme?</h3><p>Richiedi una proposta riferita al tuo progetto.</p><form method="post" action="/lavori/{p["id"]}/richiedi-preventivo">{r.csrf()}<button class="button">Richiedi preventivo</button></form></section>'
   contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
   manager_contacts=''
+  organizer=''
   if admin:
    student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
    email_link=f'<a href="mailto:{esc(student_email)}">Scrivi via email ↗</a>' if student_email else '<span>Email non disponibile</span>'
    whatsapp_link=f'<a href="https://wa.me/{esc(student.get("whatsapp"))}?text={urllib.parse.quote("Ciao, ti contatto da FormaTesi in merito al tuo lavoro.")}" target="_blank" rel="noopener">Scrivi su WhatsApp ↗</a>' if student.get('whatsapp') else '<span>WhatsApp non indicato</span>'
    manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
-  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
+   due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
+   organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
+  receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando il lavoro sarà pronto.</p></div>' if not admin and not events else ''
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
 class Request:
@@ -663,12 +734,16 @@ def badge(p):return '<span class="badge '+p['status']+'">'+STATUS[p['status']]+(
 def file_link(f):return f'<a class="file" href="/file/{f["id"]}"><span aria-hidden="true">↓</span> {esc(f["name"])} <span class="fine">Scarica</span></a>'
 def project_card(p,admin=False):
  owner=''
+ planning=''
  if admin:
   email=p.get('contact_email') or (p.get('email') if not str(p.get('email') or '').endswith('@pratica.invalid') else '')
   identity=p.get('username') or p.get('matricola') or 'Studente senza identificativo'
   contacts=' · '.join(x for x in [email,p.get('whatsapp')] if x)
   owner=f'<div class="project-owner"><strong>Studente: {esc(identity)}</strong><span>Codice: {esc(p.get("matricola"))}</span>{f"<span>{esc(contacts)}</span>" if contacts else ""}</div>'
- return f'<a class="project-card" href="/lavori/{p["id"]}"><div class="project-symbol" aria-hidden="true">F/</div><div class="project-info"><span class="eyebrow">{esc(p["ateneo"])}</span><h2>{esc(p["title"])}</h2>{owner}<p>{esc(p["subject"])}</p></div><div class="project-meta">{badge(p)}<span class="fine">Aggiornato {date(p["updated"])}</span></div><span class="card-arrow" aria-hidden="true">↗</span></a>'
+  priority={'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')
+  deadline=' · Scadenza '+datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%d/%m/%Y') if p.get('due_at') else ' · Nessuna scadenza'
+  planning=f'<div class="planning-line priority-{esc(p.get("priority") or "normal")}"><strong>Priorità {priority}</strong><span>{deadline}</span></div>'
+ return f'<a class="project-card" href="/lavori/{p["id"]}"><div class="project-symbol" aria-hidden="true">F/</div><div class="project-info"><span class="eyebrow">{esc(p["ateneo"])}</span><h2>{esc(p["title"])}</h2>{owner}{planning}<p>{esc(p["subject"])}</p></div><div class="project-meta">{badge(p)}<span class="fine">Aggiornato {date(p["updated"])}</span></div><span class="card-arrow" aria-hidden="true">↗</span></a>'
 
 def landing():
  return '''<section class="hero"><div class="hero-copy"><div class="free-pill"><span>REGALO DI BENVENUTO</span> 1 paragrafo gratuito</div><h1>La tua tesi.<br>Finalmente,<br><em>prende forma.</em></h1><p>Non devi affidarti a parole o promesse. Inviaci i dati essenziali della tua tesi: prepariamo gratuitamente un primo paragrafo dimostrativo sul tuo progetto. Lo valuti e soltanto dopo decidi se continuare.</p><div class="hero-actions"><a class="button conversion" href="/registrati">Ottieni il paragrafo gratuito <span>↗</span></a><a class="underlined" href="/anteprima">Guarda l’area personale</a></div><div class="trust-line"><span>✓ Nessun pagamento</span><span>✓ Nessun abbonamento</span><span>✓ Decidi dopo la prova</span></div></div><div class="hero-visual"><div class="orbit-label">IL TUO PROGETTO.<br>UNA PROVA CONCRETA.</div><div class="paper-stack"><div class="document hero-doc"><div class="doc-university">IL TUO PROSSIMO TRAGUARDO</div><div class="doc-rule"></div><span class="doc-kicker">PARAGRAFO DIMOSTRATIVO</span><h2>Un primo testo<br>costruito sulla<br>tua tesi.</h2><div class="paper-lines"><i></i><i></i><i></i></div><div class="doc-bottom">FormaTesi <span>PROVA GRATUITA</span></div></div></div><div class="floating-note"><span class="note-icon">✓</span><div><strong>Gratis, davvero.</strong><span>Prima valuti. Poi scegli.</span></div></div><span class="visual-caption">Una prova per studente, previa verifica.</span></div></section><section class="consulting-strip"><div><strong>Hai un dubbio prima di iniziare?</strong><span>La consulenza iniziale è gratuita.</span></div><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Scrivi ora su WhatsApp ↗</a></section><section class="university-section"><div class="section-heading compact-heading"><span class="eyebrow">CONOSCIAMO IL TUO PERCORSO</span><h2>Partiamo dal tuo ateneo.</h2><p>Seleziona l’università nella richiesta: il progetto sarà organizzato in base alle informazioni che ci fornisci.</p></div><div class="university-logos"><div class="uni-logo"><img src="https://www.centrostudibn.it/wp-content/uploads/2022/09/ecampus.png" alt="Università eCampus" loading="lazy"></div><div class="uni-logo"><img src="https://www.uniares.com/wp-content/uploads/2024/04/Pegaso-con-sfondo-white.jpg" alt="Università Telematica Pegaso" loading="lazy"></div><div class="uni-logo"><img src="https://www.studentitelematici.cloud/wp-content/uploads/2022/04/fb1e9709-c8c5-404a-9596-04c17b1ee230.png" alt="Universitas Mercatorum" loading="lazy"></div><div class="uni-logo"><img src="https://mediakey.it/wp-content/uploads/2025/06/uni-san-raffaele-logo.jpg" alt="Università San Raffaele Roma" loading="lazy"></div></div><p class="trademark-note">I marchi appartengono ai rispettivi titolari. FormaTesi è un servizio indipendente e non è affiliato agli atenei.</p></section><section id="come-funziona" class="section"><div class="section-heading"><span class="eyebrow">COME FUNZIONA</span><h2>Prima vedi come lavoriamo.<br>Poi scegli.</h2><p>Ci bastano le informazioni essenziali per preparare la tua prova personalizzata.</p></div><div class="steps"><article><span class="step-number">01</span><h3>Raccontaci la tua tesi.</h3><p>Indica ateneo, facoltà, materia e titolo. Aggiungi l’indice oppure il paragrafo da cui partire.</p></article><article class="featured-step"><span class="step-number">02</span><span class="gift-tag">TE LO REGALIAMO</span><h3>Ricevi un paragrafo gratuito.</h3><p>Il lavoro arriva nella tua area personale. È una prova concreta sul tuo progetto, non un esempio generico.</p></article><article><span class="step-number">03</span><h3>Decidi senza pressioni.</h3><p>Se il metodo ti convince, chiedi una proposta personalizzata. Prima di accettare sai che cosa comprende.</p></article></div><div class="center-cta"><a class="button conversion" href="/registrati">Richiedi la tua prova gratuita ↗</a><span>Richiede pochi minuti · una prova per studente</span></div></section><section class="feature-section"><div><span class="eyebrow">IL TUO SPAZIO, SEMPRE IN ORDINE</span><h2>Meno messaggi da cercare.<br>Più chiarezza sul lavoro.</h2><p>Ogni consegna resta nel tuo account. Le richieste di modifica sono collegate al lavoro e ogni revisione ha il proprio numero.</p><a class="button light" href="/anteprima">Esplora un’area di esempio ↗</a></div><div class="workflow-preview"><div class="preview-top"><span>Il percorso del tuo lavoro</span><span>↗</span></div><div class="workflow-row"><span class="workflow-index">01</span><div><strong>In attesa</strong><p>La richiesta è stata inviata.</p></div></div><div class="workflow-row"><span class="workflow-index">02</span><div><strong>Consegnato</strong><p>Il primo lavoro è disponibile.</p></div></div><div class="workflow-row"><span class="workflow-index">03</span><div><strong>Da revisionare</strong><p>Le tue osservazioni sono raccolte qui.</p></div></div><div class="workflow-row highlight"><span class="workflow-index">✓</span><div><strong>Revisionato <span class="mini-badge">n. 1</span></strong><p>Una nuova versione, senza perdere la precedente.</p></div></div></div></section><section class="section support"><div class="section-heading"><span class="eyebrow">DA DOVE PARTIAMO?</span><h2>Il supporto giusto<br>per il tuo momento.</h2></div><div class="support-grid"><article><span>↗</span><h3>Hai un’idea da sviluppare.</h3><p>Mettiamo a fuoco la struttura del lavoro e il percorso di ricerca.</p></article><article><span>¶</span><h3>Hai un testo da migliorare.</h3><p>Revisione del contenuto, attenzione alle fonti e alle indicazioni ricevute.</p></article><article><span>≡</span><h3>Vuoi dare ordine al documento.</h3><p>Un aiuto con l’impaginazione e la coerenza delle citazioni.</p></article></div></section><section id="domande" class="section faq"><div><span class="eyebrow">PRIMA DI COMINCIARE</span><h2>Facciamo chiarezza.</h2><p>Vuoi parlarne prima?<br><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Consulenza gratuita su WhatsApp ↗</a></p></div><div><details><summary>Che cosa ricevo gratuitamente?</summary><p>Un primo paragrafo dimostrativo preparato a partire dai dati del tuo progetto. La richiesta viene valutata e la prova è disponibile una sola volta per studente.</p></details><details><summary>La prova mi obbliga ad acquistare?</summary><p>No. Non inserisci dati di pagamento e non attivi abbonamenti. Valuti il lavoro e decidi tu se richiedere una proposta.</p></details><details><summary>Che cosa serve per iniziare?</summary><p>Ateneo, facoltà o corso di laurea, materia e titolo della tesi. Aggiungi l’indice, anche come file, oppure il titolo del paragrafo.</p></details><details><summary>Posso chiedere modifiche?</summary><p>Dopo una consegna puoi inviare una richiesta di revisione dalla tua area. Le revisioni incluse negli eventuali lavori successivi vengono indicate nella proposta.</p></details><details><summary>Siete collegati alla mia università?</summary><p>No. FormaTesi è un servizio indipendente di supporto accademico. Lo studente rimane responsabile del proprio elaborato e delle regole dell’ateneo.</p></details></div></section><section class="final-cta"><span class="eyebrow">NON DEVI ANCORA SCEGLIERCI. DEVI SOLO PROVARCI.</span><h2>Il primo paragrafo<br>lo offriamo noi.</h2><p>Nessun pagamento. Nessun abbonamento. Una prova concreta sul tuo progetto.</p><a class="button conversion" href="/registrati">Ottieni il paragrafo gratuito ↗</a><div class="direct-contacts"><a href="https://m.me/61593221212687">Preferisci Messenger?</a><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Scrivici su WhatsApp</a></div></section>'''
@@ -704,7 +779,15 @@ def public_landing(reviews,portal_ready=False):
   base=base.replace('<p>Le tue osservazioni sono raccolte qui.</p>','<p>Raccogliamo le tue osservazioni.</p>')
   base=base.replace('<p>Una nuova versione, senza perdere la precedente.</p>','<p>Ricevi la versione aggiornata e numerata.</p>')
   base=base.replace('Dopo una consegna puoi inviare una richiesta di revisione dalla tua area. Le revisioni incluse negli eventuali lavori successivi vengono indicate nella proposta.','Sì. Le revisioni comprese vengono chiarite nella proposta e ogni nuova versione è identificata con un numero.')
+ links='<nav class="university-links" aria-label="Approfondimenti per ateneo">'+''.join(f'<a href="/atenei/{slug}">{esc(name)}</a>' for slug,name in ATENEI_PAGES.items())+'</nav>'
+ base=base.replace('<p class="other-universities">E anche Bologna, Palermo, Catania, Milano, Torino e qualsiasi altro ateneo italiano.</p>','<p class="other-universities">E anche Bologna, Palermo, Catania, Milano, Torino e qualsiasi altro ateneo italiano.</p>'+links)
  return base.replace('<section id="domande"',section+'<section id="domande"',1)
+
+def university_page(slug,portal_ready=False):
+ name=ATENEI_PAGES[slug]
+ cta='/registrati' if portal_ready else WHATSAPP
+ external='' if portal_ready else ' target="_blank" rel="noopener"'
+ return f'''<section class="university-hero"><div><a class="back" href="/">← Tutti gli atenei</a><span class="eyebrow">SUPPORTO TESI · {esc(name)}</span><h1>Un primo passo concreto per la tua tesi.</h1><p>Partiamo dalle informazioni del tuo corso, dalla materia, dal titolo e dall’indice oppure dal paragrafo che vuoi sviluppare. Ricevi una prova personalizzata e valuti il metodo prima di decidere se proseguire.</p><a class="button conversion" href="{cta}"{external}>Ottieni il paragrafo gratuito ↗</a></div><aside class="panel"><h2>Che cosa ci serve</h2><ol><li>Ateneo e corso di laurea</li><li>Materia e titolo della tesi</li><li>Indice oppure titolo del paragrafo</li><li>Indicazioni ricevute dal relatore, se disponibili</li></ol><p class="notice">FormaTesi è un servizio indipendente e non è affiliato a {esc(name)}. Lo studente rimane responsabile dell’elaborato presentato e del rispetto delle regole dell’ateneo.</p></aside></section><section class="section"><div class="section-heading"><span class="eyebrow">COME TI ACCOMPAGNIAMO</span><h2>Ricerca, revisione e organizzazione.</h2><p>Il lavoro viene seguito nella tua area personale: richiesta iniziale, documenti, consegne, osservazioni e revisioni numerate rimangono nello stesso spazio.</p></div><div class="steps"><article><span class="step-number">01</span><h3>Raccogliamo il materiale.</h3><p>Controlliamo che le informazioni essenziali siano sufficienti per cominciare.</p></article><article><span class="step-number">02</span><h3>Prepariamo la prova.</h3><p>Il primo esempio è costruito sul tuo argomento, non su un facsimile generico.</p></article><article><span class="step-number">03</span><h3>Decidi con chiarezza.</h3><p>Se vuoi continuare, ricevi una proposta che specifica attività, tempi e revisioni.</p></article></div></section>'''
 
 def demo():
  return '''<section class="workspace"><div class="notice">Anteprima dimostrativa · Il progetto qui sotto è un esempio, non appartiene a uno studente reale.</div><div class="page-heading"><div><span class="eyebrow">IL TUO SPAZIO FORMATESI</span><h1>Tutto il lavoro.<br>Un unico posto.</h1><p>Ecco come ritroverai le consegne e le revisioni del tuo progetto.</p></div><a class="button" href="/registrati">Crea il tuo account ↗</a></div><div class="detail-layout"><div><section class="panel"><span class="eyebrow">ESEMPIO · SCIENZE DELL’EDUCAZIONE</span><h2>Il gioco come esperienza di apprendimento.</h2><span class="badge revised">Revisionato · Revisione n. 1</span><div class="timeline"><article class="timeline-item"><span class="eyebrow">PRIMA CONSEGNA</span><h3>1.1 Il valore educativo del gioco</h3><p>Il lavoro iniziale viene pubblicato qui. Quando il servizio è attivo, puoi aprire il testo e scaricare il documento dalla stessa scheda.</p><div class="file">Documento della prima consegna <span class="fine">Esempio</span></div></article><article class="timeline-item"><span class="eyebrow">RICHIESTA DI REVISIONE</span><h3>Le osservazioni dello studente</h3><p>“Vorrei approfondire il collegamento con le attività nella scuola dell’infanzia.”</p></article><article class="timeline-item"><span class="eyebrow">REVISIONE N. 1</span><h3>La versione aggiornata</h3><p>La revisione compare dopo la consegna, con le modifiche richieste. La versione iniziale rimane consultabile.</p></article></div></section></div><aside><section class="panel"><h3>La scheda del progetto</h3><dl><dt>Ateneo</dt><dd>eCampus · esempio</dd><dt>Facoltà / corso</dt><dd>Scienze dell’educazione · L-19</dd><dt>Materia</dt><dd>Pedagogia generale</dd><dt>Paragrafo</dt><dd>1.1 Il valore educativo del gioco</dd></dl></section><section class="aside-note"><h3>Un passaggio alla volta.</h3><p>Il numero di revisione aumenta quando ricevi una nuova versione corretta, non quando invii una richiesta.</p></section></aside></div></section>'''
