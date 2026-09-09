@@ -94,6 +94,7 @@ footer{font-size:15px}.contact-dock a{font-size:14px;min-width:138px}
 }
 @media(max-width:380px){header .brand>span:not(.brand-icon){display:none}.hero h1{font-size:44px}.hero-visual{min-height:340px}.trust-line{grid-template-columns:1fr}.trust-line span:last-child{grid-column:auto}.graduation-main{min-height:660px}}
 .contact-settings{margin:18px 0}.contact-settings summary{font-weight:800;cursor:pointer}.contact-settings form{margin-top:20px}.manager-contacts{border:2px solid #c20d4d;background:#fff8fb}.manager-contacts dl{margin-bottom:18px}.contact-actions{display:grid;gap:10px;margin:16px 0}.contact-actions a,.contact-actions span{font-weight:800;overflow-wrap:anywhere}.manager-contacts .button{margin-top:14px;text-align:center}
+.project-owner{display:flex;flex-wrap:wrap;gap:5px 14px;margin:10px 0;padding:10px 12px;border-left:4px solid var(--blue);background:#f4f6ff;border-radius:0 8px 8px 0}.project-owner strong{width:100%;font-size:15px;color:var(--blue)}.project-owner span{font-size:13px;font-weight:650;color:#48536b;overflow-wrap:anywhere}
 .code-success{text-align:center}.practice-code{font:800 clamp(26px,7vw,42px)/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:3px;color:var(--blue);background:#fff5f8;border:2px dashed #d79aae;border-radius:16px;padding:22px;margin:28px 0;user-select:all}.code-success .notice{text-align:left}.auth-intro h1{overflow-wrap:anywhere}
 @media(max-width:600px){.practice-code{font-size:25px;letter-spacing:1.5px;padding:18px 10px}.auth-layout .panel{padding:24px 20px}}
 
