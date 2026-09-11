@@ -117,7 +117,10 @@ class Site:
    if admin:self.mutate('UPDATE users SET password=?,username=?,verified=1,role=? WHERE id=?',(password_hash(self.cfg['ADMIN_SETUP_PASSWORD']),'gestore_formatesi_92','admin',admin['id']))
   essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
   legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
-  self.ready=bool(self.db and (self.testing or self.code_mode or (essentials and legal)))
+  # In produzione il portale apre le registrazioni soltanto quando database e
+  # notifiche email sono configurati. In questo modo una richiesta non può
+  # essere accettata senza poter avvisare studente e gestore.
+  self.ready=bool(self.db and (self.testing or (essentials and (self.code_mode or legal))))
  def query(self,q,args=(),one=False):
   with self.db.connect() as c:
    cur=self.db.run(c,q,args);r=cur.fetchone() if one else cur.fetchall();return dict(r) if one and r else ([dict(x) for x in r] if not one else None)
