@@ -17,7 +17,8 @@ document.querySelectorAll('form[data-upload]').forEach(form=>{
   event.preventDefault();
   const file=form.querySelector('input[type="file"]')?.files[0],button=form.querySelector('button[type="submit"],button:not([type])'),status=form.querySelector('[data-upload-status]');
   if(file && (file.size>5*1024*1024||!file.size)){status.textContent='Scegli un file non vuoto di massimo 5 MB.';return;}
-  if(file&&!/\.(pdf|docx|txt)$/i.test(file.name)){status.textContent='Sono accettati PDF, DOCX e TXT.';return;}
+  const payment=form.hasAttribute('data-payment-upload'),allowed=payment?/\.(pdf|jpe?g|png)$/i:/\.(pdf|docx|txt)$/i;
+  if(file&&!allowed.test(file.name)){status.textContent=payment?'Sono accettati PDF, JPG e PNG.':'Sono accettati PDF, DOCX e TXT.';return;}
   submitting=true;button.disabled=true;status.textContent='Invio in corso…';
   try{
    if(file){
