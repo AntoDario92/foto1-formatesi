@@ -26,6 +26,18 @@ def uid(): return uuid.uuid4().hex
 def now(): return int(time.time())
 def digest(s): return hashlib.sha256(s.encode()).hexdigest()
 def normal(s): return ' '.join(re.sub(r'[^\w\s]',' ',s.lower()).split())
+def money(cents):return f'{cents/100:,.2f}'.replace(',','X').replace('.',',').replace('X','.')
+def parse_euros(value,allow_zero=False):
+ from decimal import Decimal,InvalidOperation
+ try:
+  raw=value.strip()
+  if ',' in raw:raw=raw.replace('.','').replace(',','.')
+  elif raw.count('.')==1 and len(raw.rsplit('.',1)[1])<=2:pass
+  else:raw=raw.replace('.','')
+  amount=Decimal(raw)
+  if not amount.is_finite() or amount<0 or (not allow_zero and amount==0) or amount>100000 or amount.as_tuple().exponent < -2:raise InvalidOperation()
+  return int(amount*100)
+ except (InvalidOperation,ValueError):raise Failure('Inserisci un importo valido, con al massimo due decimali.')
 def phone_number(value):
  digits=re.sub(r'\D','',value or '')
  if digits.startswith('00'):digits=digits[2:]
@@ -63,6 +75,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_free_per_student ON projects(user_id) WHER
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,actor_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,body TEXT NOT NULL,revision INTEGER NOT NULL,created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,event_id TEXT REFERENCES events(id) ON DELETE CASCADE,name TEXT NOT NULL,mime TEXT NOT NULL,data TEXT NOT NULL,sha TEXT NOT NULL,created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),description TEXT NOT NULL,cents INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'proposed',created BIGINT NOT NULL,accepted BIGINT);
+CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,quote_id TEXT NOT NULL UNIQUE REFERENCES quotes(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,expected_cents INTEGER NOT NULL,received_cents INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',method TEXT NOT NULL DEFAULT '',transaction_ref TEXT NOT NULL DEFAULT '',proof_name TEXT,proof_mime TEXT,proof_data TEXT,proof_sha TEXT,student_note TEXT NOT NULL DEFAULT '',manager_note TEXT NOT NULL DEFAULT '',created BIGINT NOT NULL,updated BIGINT NOT NULL,confirmed BIGINT);
 CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,user_id TEXT,action TEXT NOT NULL,created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,email TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,created BIGINT NOT NULL);
@@ -98,6 +111,9 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    add_column('outbox','sent_at','BIGINT')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
+   self.run(c,'''INSERT INTO payments(id,quote_id,project_id,expected_cents,received_cents,status,created,updated)
+SELECT q.id,q.id,q.project_id,q.cents,0,'pending',q.accepted,q.accepted FROM quotes q
+WHERE q.status='accepted' AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.quote_id=q.id)''')
 
 class Site:
  def __init__(self,config=None):
@@ -249,6 +265,12 @@ class Site:
    if not f:raise Failure('File non trovato.',404)
    self.owned(r,f['project_id']);data=base64.b64decode(f['data'])
    return data,200,[('Content-Type',f['mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(f['name']))]
+  if p.startswith('/pagamenti/') and p.endswith('/contabile'):
+   payment_id=p.strip('/').split('/')[1]
+   payment=self.query('SELECT * FROM payments WHERE id=?',(payment_id,),True)
+   if not payment or not payment.get('proof_data'):raise Failure('Contabile non trovata.',404)
+   self.owned(r,payment['project_id'])
+   return base64.b64decode(payment['proof_data']),200,[('Content-Type',payment['proof_mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(payment['proof_name']))]
   if p.startswith('/lavori/'):
    bits=p.strip('/').split('/');project=self.owned(r,bits[1]);action=bits[2] if len(bits)>2 else ''
    if action=='riepilogo.docx':
@@ -527,8 +549,8 @@ class Site:
  def save_file(self,c,project,event,attachment):
   name,mime,data=attachment;self.db.run(c,'INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(uid(),project,event,name,mime,base64.b64encode(data).decode(),hashlib.sha256(data).hexdigest(),now()))
  def project_action(self,r,p,action):
-  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza']:raise Failure('Azione non valida.',404)
-  if action in ['consegna','preventivo','organizza']:r.admin()
+  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento']:raise Failure('Azione non valida.',404)
+  if action in ['consegna','preventivo','organizza','conferma-pagamento']:r.admin()
   elif r.user['id']!=p['user_id']:raise Failure('Questa azione è riservata allo studente.',403)
   if action=='consegna':
    recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
@@ -568,6 +590,8 @@ class Site:
     if r.data.get('confirm')!='yes':raise Failure('Conferma di aver letto la proposta.')
     changed=self.db.run(c,'UPDATE quotes SET status=?,accepted=? WHERE id=? AND project_id=? AND status=?',('accepted',now(),r.data.get('quote'),p['id'],'proposed')).rowcount
     if not changed:raise Failure('La proposta è già stata aggiornata. Ricarica la pagina.',409)
+    quote=self.db.run(c,'SELECT * FROM quotes WHERE id=?',(r.data.get('quote'),)).fetchone();stamp=now()
+    self.db.run(c,'INSERT INTO payments(id,quote_id,project_id,expected_cents,received_cents,status,created,updated) VALUES(?,?,?,?,0,?,?,?)',(quote['id'],quote['id'],p['id'],quote['cents'],'pending',stamp,stamp))
     self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'support_started','Percorso di affiancamento e revisione confermato.',p['revision'],now()))
     self.db.run(c,'UPDATE projects SET status=?,updated=? WHERE id=?',('revision_requested',now(),p['id']))
    elif action=='richiedi-preventivo':
@@ -582,6 +606,25 @@ class Site:
     note=r.data.get('manager_note','').strip()
     if len(note)>2000:raise Failure('La nota interna è troppo lunga.')
     self.db.run(c,'UPDATE projects SET priority=?,due_at=?,manager_note=?,updated=? WHERE id=?',(priority,due_at,note,now(),p['id']))
+   elif action=='pagamento':
+    payment=self.db.run(c,'SELECT * FROM payments WHERE id=? AND project_id=?',(r.data.get('payment'),p['id'])).fetchone()
+    if not payment:raise Failure('Pagamento non trovato.',404)
+    transaction=r.data.get('transaction_ref','').strip();note=r.data.get('student_note','').strip();method=r.data.get('payment_method','bonifico')
+    if method not in ['bonifico','altro']:raise Failure('Metodo di pagamento non valido.')
+    if len(transaction)>150 or len(note)>1000:raise Failure('Le informazioni sul pagamento sono troppo lunghe.')
+    proof=r.payment_attachment()
+    if not transaction and not proof:raise Failure('Inserisci il numero della transazione oppure carica la contabile.')
+    values=(proof[0],proof[1],base64.b64encode(proof[2]).decode(),hashlib.sha256(proof[2]).hexdigest()) if proof else (payment['proof_name'],payment['proof_mime'],payment['proof_data'],payment['proof_sha'])
+    status=payment['status'] if payment['status'] in ['paid','partial'] else 'proof_submitted'
+    self.db.run(c,'UPDATE payments SET status=?,method=?,transaction_ref=?,proof_name=?,proof_mime=?,proof_data=?,proof_sha=?,student_note=?,updated=? WHERE id=?',(status,method,transaction,*values,note,now(),payment['id']))
+   elif action=='conferma-pagamento':
+    payment=self.db.run(c,'SELECT * FROM payments WHERE id=? AND project_id=?',(r.data.get('payment'),p['id'])).fetchone()
+    if not payment:raise Failure('Pagamento non trovato.',404)
+    received=parse_euros(r.require('received_amount',20),allow_zero=True);note=r.data.get('manager_note','').strip();method=r.data.get('payment_method',payment['method'] or 'bonifico')
+    if method not in ['bonifico','altro']:raise Failure('Metodo di pagamento non valido.')
+    if len(note)>1000:raise Failure('La nota del gestore è troppo lunga.')
+    status='paid' if received>=payment['expected_cents'] else ('partial' if received>0 else ('proof_submitted' if payment['proof_data'] or payment['transaction_ref'] else 'pending'))
+    self.db.run(c,'UPDATE payments SET received_cents=?,status=?,method=?,manager_note=?,updated=?,confirmed=? WHERE id=?',(received,status,method,note,now(),now(),payment['id']))
   self.audit(r.user['id'],action+':'+p['id'])
   updated=self.query('SELECT * FROM projects WHERE id=?',(p['id'],),True)
   if action=='consegna':
@@ -593,10 +636,15 @@ class Site:
   elif action=='accetta':
    self.notify_admin(updated,'Percorso FormaTesi confermato','Lo studente ha accettato la proposta di affiancamento e revisione. Il progetto è ora pronto per il materiale successivo.')
    self.notify(updated,'Il tuo percorso FormaTesi è attivo','Hai confermato la proposta. Da ora seguirai nell’area personale i materiali di supporto, gli aggiornamenti e le revisioni numerate.')
+  elif action=='pagamento':self.notify_admin(updated,'Pagamento comunicato da uno studente FormaTesi','Lo studente ha inserito una contabile o un numero di transazione. Verifica il pagamento dal pannello gestore prima di segnarlo come ricevuto.')
+  elif action=='conferma-pagamento':
+   payment=self.query('SELECT * FROM payments WHERE id=?',(r.data.get('payment'),),True);label='pagamento completo' if payment['status']=='paid' else ('pagamento parziale' if payment['status']=='partial' else 'pagamento da completare')
+   self.notify(updated,'Aggiornamento pagamento FormaTesi','Il gestore ha aggiornato il tuo pagamento: '+label+'. Importo ricevuto e residuo sono visibili nella tua area personale.')
   return self.redirect('/lavori/'+p['id'])
  def project_summary_docx(self,p):
   student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True)
   files=self.query('SELECT name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
+  payments=self.query('SELECT * FROM payments WHERE project_id=? ORDER BY created',(p['id'],))
   doc=Document();section=doc.sections[0];section.page_width=Inches(8.5);section.page_height=Inches(11)
   section.top_margin=section.bottom_margin=Inches(.75);section.left_margin=section.right_margin=Inches(.8)
   styles=doc.styles;styles['Normal'].font.name='Aptos';styles['Normal'].font.size=Pt(11)
@@ -610,6 +658,9 @@ class Site:
   email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
   section_table('Studente e contatti',[('Codice di accesso',student['matricola']),('Username',student.get('username')),('Nome e cognome',(student['name']+' '+student['surname']) if student['name']!='Studente' else 'Non raccolti'),('Email',email),('WhatsApp',student.get('whatsapp')),('Consenso comunicazioni WhatsApp','Sì' if student.get('whatsapp_opt_in') else 'No')])
   section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Priorità',{'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')),('Scadenza interna',date(p['due_at']) if p.get('due_at') else 'Non impostata'),('Nota riservata al gestore',p.get('manager_note')),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
+  for index,payment in enumerate(payments,1):
+   labels={'pending':'In attesa di pagamento','proof_submitted':'Comunicata, da verificare','partial':'Pagamento parziale','paid':'Pagato'}
+   section_table('Pagamento '+str(index),[('Stato',labels.get(payment['status'],payment['status'])),('Importo previsto','€ '+money(payment['expected_cents'])),('Importo ricevuto e verificato','€ '+money(payment['received_cents'])),('Residuo','€ '+money(max(0,payment['expected_cents']-payment['received_cents']))),('Metodo',payment['method']),('Numero transazione',payment['transaction_ref']),('Contabile caricata',payment['proof_name']),('Nota dello studente',payment['student_note']),('Nota riservata del gestore',payment['manager_note'])])
   doc.add_heading('Indice o indicazioni iniziali',level=1);doc.add_paragraph(p['outline'] or 'Non inserito come testo.')
   doc.add_heading('File caricati',level=1)
   if files:
@@ -621,6 +672,7 @@ class Site:
  def project_page(self,r,p):
   admin=r.user['role']=='admin';events=self.query('SELECT * FROM events WHERE project_id=? ORDER BY created,id',(p['id'],));files=self.query('SELECT id,event_id,name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
   quotes=self.query('SELECT * FROM quotes WHERE project_id=? ORDER BY created DESC',(p['id'],))
+  payments=self.query('SELECT * FROM payments WHERE project_id=? ORDER BY created DESC',(p['id'],))
   student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True)
   history=''
   for e in events:
@@ -651,12 +703,24 @@ class Site:
    editor=f'<section class="panel"><h2>{label}</h2><form method="post" action="/lavori/{p["id"]}/{action}" data-upload>{r.csrf()}<input type="hidden" name="version" value="{p["revision"]}"><input type="hidden" name="status" value="{p["status"]}"><label>{"Nota di accompagnamento" if can_deliver else "Quali modifiche servono?"}<textarea name="body" rows="9" maxlength="100000" {"" if can_deliver else "required"}></textarea></label><label>{"Materiale da pubblicare" if can_deliver else "Osservazioni del relatore o altro allegato"}<input type="file" id="attachment" accept=".pdf,.docx,.txt"></label><p class="fine">PDF, DOCX o TXT · massimo 5 MB</p><input type="hidden" name="file_name"><input type="hidden" name="file_data"><button class="button">{label}</button><p role="status" data-upload-status></p></form></section>'
   proposal=''
   for q in quotes:
-   proposal+=f'<article class="quote"><span class="eyebrow">{"Proposta precedente" if q["status"]=="superseded" else "La tua proposta"}</span><h2>€ {q["cents"]/100:,.2f}</h2><div class="prose">{esc(q["description"])}</div>'
+   proposal+=f'<article class="quote"><span class="eyebrow">{"Proposta precedente" if q["status"]=="superseded" else "La tua proposta"}</span><h2>€ {money(q["cents"])}</h2><div class="prose">{esc(q["description"])}</div>'
    if q['status']=='accepted':proposal+='<p class="badge success">Percorso confermato il '+date(q['accepted'])+'</p><p class="fine">Il percorso riguarda affiancamento metodologico, revisione e materiali di supporto. Nessun pagamento viene effettuato sul sito.</p>'
    elif q['status']=='proposed' and not admin:proposal+=f'<form method="post" action="/lavori/{p["id"]}/accetta">{r.csrf()}<input type="hidden" name="quote" value="{q["id"]}"><label class="check"><input type="checkbox" name="confirm" value="yes" required> Ho letto la proposta e desidero essere contattato per procedere.</label><button class="button">Conferma interesse</button><p class="fine">Questa conferma non addebita importi e non conclude un acquisto.</p></form>'
    proposal+='</article>'
   if admin:proposal+=f'<details class="panel"><summary>Prepara un preventivo</summary><form method="post" action="/lavori/{p["id"]}/preventivo">{r.csrf()}{field("amount","Importo complessivo in euro",extra="inputmode=decimal")}<label>Cosa comprende, tempi e revisioni incluse<textarea name="description" rows="6" required maxlength="10000"></textarea></label><button class="button">Invia la proposta</button></form></details>'
   elif not quotes:proposal+=f'<section class="panel"><h3>Vuoi proseguire insieme?</h3><p>Richiedi una proposta per un percorso personalizzato di affiancamento e revisione.</p><form method="post" action="/lavori/{p["id"]}/richiedi-preventivo">{r.csrf()}<button class="button">Richiedi una proposta</button></form></section>'
+  payment_html=''
+  payment_labels={'pending':'In attesa di pagamento','proof_submitted':'Pagamento comunicato · da verificare','partial':'Pagamento parziale','paid':'Pagato'}
+  for payment in payments:
+   residual=max(0,payment['expected_cents']-payment['received_cents']);status_label=payment_labels.get(payment['status'],'Da verificare')
+   proof=f'<a class="file" href="/pagamenti/{payment["id"]}/contabile"><span aria-hidden="true">↓</span> {esc(payment["proof_name"])} <span class="fine">Scarica contabile</span></a>' if payment.get('proof_data') else ''
+   reference=f'<dl class="payment-details"><dt>Metodo indicato</dt><dd>{esc(payment["method"] or "Non indicato")}</dd><dt>Numero transazione</dt><dd>{esc(payment["transaction_ref"] or "Non indicato")}</dd></dl>' if payment.get('transaction_ref') or payment.get('method') else ''
+   totals=f'<div class="payment-summary"><div><span>Importo previsto</span><strong>€ {money(payment["expected_cents"])}</strong></div><div><span>Ricevuto e verificato</span><strong>€ {money(payment["received_cents"])}</strong></div><div class="payment-residual"><span>Residuo</span><strong>€ {money(residual)}</strong></div></div>'
+   if admin:
+    form=f'''<form method="post" action="/lavori/{p["id"]}/conferma-pagamento" class="payment-form">{r.csrf()}<input type="hidden" name="payment" value="{payment["id"]}"><label>Importo effettivamente ricevuto<input name="received_amount" inputmode="decimal" required value="{money(payment["received_cents"])}"></label><label>Metodo<select name="payment_method"><option value="bonifico" {"selected" if payment["method"]=="bonifico" else ""}>Bonifico</option><option value="altro" {"selected" if payment["method"]=="altro" else ""}>Altro</option></select></label><label>Nota riservata del gestore<textarea name="manager_note" rows="3" maxlength="1000">{esc(payment["manager_note"])}</textarea></label><button class="button full">Aggiorna e avvisa lo studente</button></form>'''
+   else:
+    form='' if payment['status']=='paid' else f'''<form method="post" action="/lavori/{p["id"]}/pagamento" data-upload data-payment-upload>{r.csrf()}<input type="hidden" name="payment" value="{payment["id"]}"><label>Metodo<select name="payment_method"><option value="bonifico">Bonifico</option><option value="altro">Altro</option></select></label><label>Numero della transazione (se disponibile)<input name="transaction_ref" maxlength="150" value="{esc(payment["transaction_ref"])}"></label><label>Oppure carica la contabile<input type="file" accept=".pdf,.jpg,.jpeg,.png"></label><p class="fine">PDF, JPG o PNG · massimo 5 MB.</p><input type="hidden" name="file_name"><input type="hidden" name="file_data"><label>Nota facoltativa<textarea name="student_note" rows="3" maxlength="1000">{esc(payment["student_note"])}</textarea></label><button class="button full">Comunica il pagamento</button><p class="fine" data-upload-status role="status">La comunicazione non segna automaticamente il pagamento come ricevuto: il gestore lo verificherà.</p></form>'''
+   payment_html+=f'<section class="panel payment-card"><div class="payment-heading"><div><span class="eyebrow">SITUAZIONE PAGAMENTO</span><h2>{status_label}</h2></div><span class="payment-status payment-{payment["status"]}">{status_label}</span></div>{totals}{reference}{proof}{form}</section>'
   contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
   manager_contacts=''
   organizer=''
@@ -668,7 +732,7 @@ class Site:
    due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
    organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
   receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando la prova metodologica sarà disponibile.</p></div>' if not admin and not events else ''
-  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{proposal}{contact_html}</aside></div></section>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
 class Request:
@@ -736,6 +800,18 @@ class Request:
    try:data.decode('utf-8')
    except UnicodeDecodeError:raise Failure('Salva il file di testo in formato UTF-8.')
   return name,{'.pdf':'application/pdf','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','.txt':'text/plain'}[extension],data
+ def payment_attachment(self):
+  name=self.data.get('file_name','');raw=self.data.get('file_data','')
+  if not name and not raw:return None
+  if not name or not raw:raise Failure('La contabile non è stata caricata. Riprova.')
+  name=name.replace('\\','/').split('/')[-1][:180];extension=Path(name).suffix.lower()
+  if extension not in ['.pdf','.jpg','.jpeg','.png']:raise Failure('La contabile deve essere in formato PDF, JPG o PNG.')
+  try:data=base64.b64decode(raw,validate=True)
+  except Exception:raise Failure('Contabile non valida.')
+  if not data or len(data)>5*1024*1024:raise Failure('La contabile deve essere inferiore a 5 MB.',413)
+  signatures={'.pdf':b'%PDF-','.jpg':b'\xff\xd8\xff','.jpeg':b'\xff\xd8\xff','.png':b'\x89PNG\r\n\x1a\n'}
+  if not data.startswith(signatures[extension]):raise Failure('Il contenuto della contabile non corrisponde al formato indicato.')
+  return name,{'.pdf':'application/pdf','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png'}[extension],data
 
 def date(timestamp):return datetime.datetime.fromtimestamp(timestamp,datetime.timezone.utc).strftime('%d/%m/%Y · %H:%M UTC')
 def field(name,label,kind='text',autocomplete='',extra='',required=True,placeholder=''):
