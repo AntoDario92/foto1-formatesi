@@ -1,0 +1,897 @@
+"""FormaTesi: WSGI application. PostgreSQL in production; SQLite only for local tests."""
+import base64, contextlib, datetime, hashlib, hmac, html, http.cookies, io, json, os, re, secrets, sqlite3, time, urllib.parse, urllib.request, uuid
+from pathlib import Path
+try:
+ from docx import Document
+ from docx.enum.text import WD_ALIGN_PARAGRAPH
+ from docx.shared import Inches, Pt
+except ImportError:  # L'esportazione del sito pubblico non genera documenti Word.
+ Document=WD_ALIGN_PARAGRAPH=Inches=Pt=None
+
+ROOT=Path(__file__).parent
+FB='https://www.facebook.com/profile.php?id=61593221212687'
+FB_REVIEWS=FB+'&sk=reviews'
+MESSENGER='https://m.me/61593221212687'
+WHATSAPP='https://wa.me/393505815735?text='+urllib.parse.quote('Ciao FormaTesi, vorrei una consulenza per la mia tesi.')
+SOCIAL_ICONS={
+ 'facebook':'<svg class="social-svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073C0 18.1 4.388 23.094 10.125 24v-8.437H7.078v-3.49h3.047V9.414c0-3.025 1.792-4.697 4.533-4.697 1.313 0 2.686.236 2.686.236v2.971h-1.513c-1.49 0-1.956.931-1.956 1.887v2.262h3.328l-.532 3.49h-2.796V24C19.612 23.094 24 18.1 24 12.073z"/></svg>',
+ 'messenger':'<svg class="social-svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2C6.477 2 2 6.145 2 11.259c0 2.914 1.454 5.514 3.727 7.211V22l3.405-1.868c.91.251 1.872.387 2.868.387 5.523 0 10-4.145 10-9.26S17.523 2 12 2zm.994 12.469-2.547-2.718-4.974 2.718 5.471-5.807 2.609 2.718 4.912-2.718-5.471 5.807z"/></svg>',
+ 'whatsapp':'<svg class="social-svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.04 2a9.84 9.84 0 0 0-8.52 14.76L2 22l5.38-1.41A9.95 9.95 0 1 0 12.04 2zm5.79 14.05c-.25.7-1.45 1.34-2 1.42-.51.08-1.16.11-1.87-.12-.43-.14-.98-.32-1.69-.63-2.97-1.28-4.9-4.27-5.05-4.47-.15-.2-1.21-1.61-1.21-3.07s.77-2.18 1.04-2.48c.27-.3.59-.37.79-.37h.57c.18.01.43-.07.67.51.25.6.84 2.05.91 2.2.08.15.13.32.03.52-.1.2-.15.32-.3.49-.15.17-.31.37-.45.49-.15.15-.3.31-.13.61.17.3.75 1.23 1.61 1.99 1.11.99 2.04 1.3 2.34 1.45.3.15.47.13.64-.08.17-.2.74-.86.94-1.16.2-.3.4-.25.67-.15.27.1 1.73.82 2.03.97.3.15.49.22.57.34.07.13.07.72-.18 1.42z"/></svg>'
+}
+ATENEI=['eCampus','Pegaso','Universitas Mercatorum','San Raffaele Roma','UnitelmaSapienza','Università Guglielmo Marconi','Università Niccolò Cusano','UNINETTUNO','IUL Università Telematica','Università Giustino Fortunato','Università di Roma La Sapienza','Università Federico II di Napoli','Università di Bologna','Università di Palermo','Università di Catania','Università degli Studi di Milano','Università di Torino','Altro ateneo']
+ATENEI_PAGES={'ecampus':'eCampus','pegaso':'Pegaso','mercatorum':'Universitas Mercatorum','san-raffaele':'San Raffaele Roma','unitelma':'UnitelmaSapienza','marconi':'Università Guglielmo Marconi','unicusano':'Università Niccolò Cusano','uninettuno':'UNINETTUNO'}
+STATUS={'waiting':'In valutazione','delivered':'Materiale disponibile','revision_requested':'Affiancamento in corso','revised':'Revisionato'}
+def esc(s): return html.escape(str(s or ''),quote=True)
+def uid(): return uuid.uuid4().hex
+def now(): return int(time.time())
+def digest(s): return hashlib.sha256(s.encode()).hexdigest()
+def normal(s): return ' '.join(re.sub(r'[^\w\s]',' ',s.lower()).split())
+def money(cents):return f'{cents/100:,.2f}'.replace(',','X').replace('.',',').replace('X','.')
+def parse_euros(value,allow_zero=False):
+ from decimal import Decimal,InvalidOperation
+ try:
+  raw=value.strip()
+  if ',' in raw:raw=raw.replace('.','').replace(',','.')
+  elif raw.count('.')==1 and len(raw.rsplit('.',1)[1])<=2:pass
+  else:raw=raw.replace('.','')
+  amount=Decimal(raw)
+  if not amount.is_finite() or amount<0 or (not allow_zero and amount==0) or amount>100000 or amount.as_tuple().exponent < -2:raise InvalidOperation()
+  return int(amount*100)
+ except (InvalidOperation,ValueError):raise Failure('Inserisci un importo valido, con al massimo due decimali.')
+def phone_number(value):
+ digits=re.sub(r'\D','',value or '')
+ if digits.startswith('00'):digits=digits[2:]
+ if len(digits)==10 and digits.startswith('3'):digits='39'+digits
+ return digits if re.fullmatch(r'\d{10,15}',digits) else ''
+def password_hash(s):
+ salt=secrets.token_hex(16); return salt+':'+hashlib.scrypt(s.encode(),salt=salt.encode(),n=16384,r=8,p=1).hex()
+def password_ok(s,stored):
+ try:
+  salt,val=stored.split(':'); return hmac.compare_digest(hashlib.scrypt(s.encode(),salt=salt.encode(),n=16384,r=8,p=1).hex(),val)
+ except Exception:return False
+class Failure(Exception):
+ def __init__(self,message,code=400):self.message=message;self.code=code
+class Database:
+ def __init__(self,url):self.url=url;self.pg=url.startswith(('postgres://','postgresql://'))
+ @contextlib.contextmanager
+ def connect(self):
+  if self.pg:
+   import psycopg
+   from psycopg.rows import dict_row
+   c=psycopg.connect(self.url,row_factory=dict_row)
+  else:
+   c=sqlite3.connect(self.url,timeout=15);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON')
+  try:yield c;c.commit()
+  except: c.rollback();raise
+  finally:c.close()
+ def sql(self,q):return q.replace('?','%s') if self.pg else q
+ def run(self,c,q,args=()):return c.execute(self.sql(q),args)
+ def init(self):
+  schema='''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT NOT NULL,surname TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password TEXT NOT NULL,matricola TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,role TEXT NOT NULL DEFAULT 'student',created BIGINT NOT NULL,facebook_id TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,csrf TEXT NOT NULL,expires BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS tokens(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,expires BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),ateneo TEXT NOT NULL,faculty TEXT NOT NULL,subject TEXT NOT NULL,title TEXT NOT NULL,outline TEXT NOT NULL,paragraph TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'waiting',revision INTEGER NOT NULL DEFAULT 0,free INTEGER NOT NULL DEFAULT 1,identity_key TEXT NOT NULL,created BIGINT NOT NULL,updated BIGINT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS one_free_per_student ON projects(user_id) WHERE free=1;
+CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,actor_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,body TEXT NOT NULL,revision INTEGER NOT NULL,created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,event_id TEXT REFERENCES events(id) ON DELETE CASCADE,name TEXT NOT NULL,mime TEXT NOT NULL,data TEXT NOT NULL,sha TEXT NOT NULL,created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),description TEXT NOT NULL,cents INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'proposed',created BIGINT NOT NULL,accepted BIGINT);
+CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,quote_id TEXT NOT NULL UNIQUE REFERENCES quotes(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,expected_cents INTEGER NOT NULL,received_cents INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',method TEXT NOT NULL DEFAULT '',transaction_ref TEXT NOT NULL DEFAULT '',proof_name TEXT,proof_mime TEXT,proof_data TEXT,proof_sha TEXT,student_note TEXT NOT NULL DEFAULT '',manager_note TEXT NOT NULL DEFAULT '',created BIGINT NOT NULL,updated BIGINT NOT NULL,confirmed BIGINT);
+CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,user_id TEXT,action TEXT NOT NULL,created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,email TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body TEXT NOT NULL,rating INTEGER NOT NULL,review_url TEXT NOT NULL,review_date TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 1,created BIGINT NOT NULL);'''
+  with self.connect() as c:
+   for q in schema.split(';'):
+    if q.strip():self.run(c,q)
+   if self.pg:
+    found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='facebook_id'").fetchone()
+   else:found=any(x['name']=='facebook_id' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not found:self.run(c,'ALTER TABLE users ADD COLUMN facebook_id TEXT')
+   if self.pg:contact_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='contact_email'").fetchone()
+   else:contact_found=any(x['name']=='contact_email' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not contact_found:self.run(c,'ALTER TABLE users ADD COLUMN contact_email TEXT')
+   if self.pg:username_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='username'").fetchone()
+   else:username_found=any(x['name']=='username' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not username_found:self.run(c,'ALTER TABLE users ADD COLUMN username TEXT')
+   if self.pg:whatsapp_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='whatsapp'").fetchone()
+   else:whatsapp_found=any(x['name']=='whatsapp' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not whatsapp_found:self.run(c,'ALTER TABLE users ADD COLUMN whatsapp TEXT')
+   if self.pg:optin_found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='whatsapp_opt_in'").fetchone()
+   else:optin_found=any(x['name']=='whatsapp_opt_in' for x in self.run(c,'PRAGMA table_info(users)').fetchall())
+   if not optin_found:self.run(c,'ALTER TABLE users ADD COLUMN whatsapp_opt_in INTEGER NOT NULL DEFAULT 0')
+   def add_column(table,column,declaration):
+    if self.pg:found=self.run(c,"SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?",(table,column)).fetchone()
+    else:found=any(x['name']==column for x in self.run(c,'PRAGMA table_info('+table+')').fetchall())
+    if not found:self.run(c,'ALTER TABLE '+table+' ADD COLUMN '+column+' '+declaration)
+   add_column('projects','priority',"TEXT NOT NULL DEFAULT 'normal'")
+   add_column('projects','due_at','BIGINT')
+   add_column('projects','manager_note','TEXT')
+   add_column('outbox','attempts','INTEGER NOT NULL DEFAULT 0')
+   add_column('outbox','last_error','TEXT')
+   add_column('outbox','sent_at','BIGINT')
+   self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
+   self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
+   self.run(c,'''INSERT INTO payments(id,quote_id,project_id,expected_cents,received_cents,status,created,updated)
+SELECT q.id,q.id,q.project_id,q.cents,0,'pending',q.accepted,q.accepted FROM quotes q
+WHERE q.status='accepted' AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.quote_id=q.id)''')
+
+class Site:
+ def __init__(self,config=None):
+  self.cfg=dict(os.environ);self.cfg.update(config or {});self.testing=self.cfg.get('TESTING')=='1'
+  self.origin=self.cfg.get('PUBLIC_URL','http://localhost:8000').rstrip('/')
+  url=self.cfg.get('DATABASE_URL','')
+  if not url and self.testing:url=self.cfg['TEST_DB']
+  self.db=Database(url) if url else None
+  if self.db:
+   if not self.testing and not self.db.pg:raise RuntimeError('Production requires durable PostgreSQL DATABASE_URL')
+   self.db.init()
+  self.code_mode=self.cfg.get('CODE_PORTAL')=='yes'
+  if self.db and self.code_mode and self.cfg.get('ADMIN_EMAIL') and not self.query('SELECT id FROM users WHERE email=?',(self.cfg['ADMIN_EMAIL'].lower(),),True):
+   self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,1,?,?)',(uid(),'FormaTesi','Gestore',self.cfg['ADMIN_EMAIL'].lower(),password_hash(secrets.token_urlsafe(40)),'GESTORE','admin',now()))
+  if self.db and self.code_mode and self.cfg.get('ADMIN_EMAIL') and self.cfg.get('ADMIN_SETUP_PASSWORD'):
+   admin=self.query('SELECT * FROM users WHERE email=?',(self.cfg['ADMIN_EMAIL'].lower(),),True)
+   if admin:self.mutate('UPDATE users SET password=?,username=?,verified=1,role=? WHERE id=?',(password_hash(self.cfg['ADMIN_SETUP_PASSWORD']),'gestore_formatesi_92','admin',admin['id']))
+  essentials=all(self.cfg.get(k) for k in ['BREVO_API_KEY','MAIL_FROM','ADMIN_EMAIL','PUBLIC_URL'])
+  legal=all(self.cfg.get(k) for k in ['BUSINESS_NAME','PRIVACY_CONTACT','PRIVACY_PROVIDERS','RETENTION_POLICY']) and self.cfg.get('LEGAL_READY')=='yes'
+  # In produzione il portale apre le registrazioni soltanto quando database e
+  # notifiche email sono configurati. In questo modo una richiesta non può
+  # essere accettata senza poter avvisare studente e gestore.
+  self.ready=bool(self.db and (self.testing or (essentials and (self.code_mode or legal))))
+ def query(self,q,args=(),one=False):
+  with self.db.connect() as c:
+   cur=self.db.run(c,q,args);r=cur.fetchone() if one else cur.fetchall();return dict(r) if one and r else ([dict(x) for x in r] if not one else None)
+ def mutate(self,q,args=()):
+  with self.db.connect() as c:self.db.run(c,q,args)
+ def audit(self,u,action):self.mutate('INSERT INTO audit VALUES(?,?,?,?)',(uid(),u,action,now()))
+ def limit(self,key,maximum=10,seconds=900):
+  key=digest(key)
+  with self.db.connect() as c:
+   self.db.run(c,'DELETE FROM rate_limits WHERE expires<?',(now(),))
+   self.db.run(c,'INSERT INTO rate_limits VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=rate_limits.count+1',(key,now()+seconds))
+   r=self.db.run(c,'SELECT count FROM rate_limits WHERE key=?',(key,)).fetchone()
+   if r['count']>maximum:raise Failure('Troppi tentativi. Riprova tra qualche minuto.',429)
+ def mail(self,email,subject,body):
+  ident=uid();self.mutate('INSERT INTO outbox(id,email,subject,body,sent,created,attempts,last_error,sent_at) VALUES(?,?,?,?,0,?,0,NULL,NULL)',(ident,email,subject,body,now()))
+  if self.testing:return
+  self.send_mail(ident,email,subject,body)
+ def send_mail(self,ident,email,subject,body):
+  try:
+   sender_email=self.cfg['MAIL_FROM'].strip()
+   sender_name=self.cfg.get('MAIL_FROM_NAME','FormaTesi').strip() or 'FormaTesi'
+   match=re.fullmatch(r'\\s*(.*?)\\s*<([^<>]+)>\\s*',sender_email)
+   if match:sender_name=match.group(1).strip() or sender_name;sender_email=match.group(2).strip()
+   payload=json.dumps({'sender':{'name':sender_name,'email':sender_email},'to':[{'email':email}],'subject':subject,'textContent':body}).encode()
+   req=urllib.request.Request('https://api.brevo.com/v3/smtp/email',data=payload,headers={'api-key':self.cfg['BREVO_API_KEY'],'Accept':'application/json','Content-Type':'application/json'})
+   with urllib.request.urlopen(req,timeout=8) as response:
+    if response.status not in (200,201):return
+   self.mutate('UPDATE outbox SET sent=1,body=?,attempts=attempts+1,last_error=NULL,sent_at=? WHERE id=?',('[Messaggio inviato]',now(),ident))
+  except Exception as exc:
+   self.mutate('UPDATE outbox SET attempts=attempts+1,last_error=? WHERE id=?',(str(exc)[:500],ident))
+   import logging;logging.exception('Email FormaTesi non inviata') # Retained outbox permits an explicit admin retry without losing deliveries.
+ def token(self,user,kind):
+  raw=secrets.token_urlsafe(32)
+  with self.db.connect() as c:
+   self.db.run(c,'DELETE FROM tokens WHERE user_id=? AND kind=?',(user['id'],kind))
+   self.db.run(c,'INSERT INTO tokens VALUES(?,?,?,?)',(digest(raw),user['id'],kind,now()+3600))
+  return raw
+ def notify(self,project,subject,message=''):
+  user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
+  email=user.get('contact_email') or (user['email'] if not user['email'].endswith('@pratica.invalid') else '')
+  if not email:return
+  greeting='Ciao,\n\n'
+  text=(message.strip()+'\n\n' if message.strip() else 'Ci sono aggiornamenti nel tuo spazio FormaTesi.\n\n')
+  access=(self.origin+'/login\n\nCodice di accesso: '+user['matricola'] if user['email'].endswith('@pratica.invalid') else self.origin+'/lavori/'+project['id'])
+  self.mail(email,subject,greeting+text+'Accedi in modo sicuro alla tua richiesta:\n'+access+'\n\nFormaTesi')
+ def notify_admin(self,project,subject,message):
+  user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
+  identity=(['Codice di accesso: '+user['matricola']] if user['email'].endswith('@pratica.invalid') else ['Studente: '+user['name']+' '+user['surname'],'Email: '+user['email'],'Matricola: '+user['matricola']])
+  details='\n'.join(identity+['Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Paragrafo richiesto: '+(project['paragraph'] or 'non indicato')])
+  self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),subject,message.strip()+'\n\n'+details+'\n\nApri la richiesta:\n'+self.origin+'/lavori/'+project['id'])
+ def __call__(self,environ,start_response):
+  self_req=Request(self,environ)
+  try:body,code,headers=self.route(self_req)
+  except Failure as e:body,code,headers=self.page(self_req,'Attenzione',f'<section class="narrow panel"><span class="eyebrow">FormaTesi</span><h1>Un momento.</h1><p role="alert">{esc(e.message)}</p><a class="button" href="/area">Torna alla tua area</a></section>'),e.code,[]
+  except Exception as e:
+   import logging;logging.exception('Request failed')
+   body,code,headers=self.page(self_req,'Problema temporaneo','<section class="narrow panel"><h1>Qualcosa non ha funzionato.</h1><p>Riprova tra poco. Le consegne già salvate restano nel tuo account.</p><a href="/area">Torna alla tua area</a></section>'),500,[]
+  if isinstance(body,str):body=body.encode()
+  headers=[('Content-Type','text/html; charset=utf-8'),('Content-Length',str(len(body))),('X-Content-Type-Options','nosniff'),('Referrer-Policy','same-origin'),('X-Frame-Options','DENY'),('Content-Security-Policy',"default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: https://www.centrostudibn.it https://www.uniares.com https://www.studentitelematici.cloud https://mediakey.it; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://www.facebook.com"),('Cache-Control','no-store'),*headers]
+  # avoid duplicate Content-Type for downloads/static assets
+  types=[v for k,v in headers if k.lower()=='content-type'];headers=[(k,v) for k,v in headers if k.lower()!='content-type']+[('Content-Type',types[-1])]
+  if not self.testing:headers.append(('Strict-Transport-Security','max-age=31536000; includeSubDomains'))
+  if self_req.cookie:headers.append(('Set-Cookie',self_req.cookie))
+  start_response(str(code)+' '+{200:'OK',303:'See Other',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',409:'Conflict',413:'Content Too Large',429:'Too Many Requests',500:'Internal Server Error',503:'Service Unavailable'}.get(code,'OK'),headers)
+  return [body]
+ def redirect(self,url):return '',303,[('Location',url)]
+ def page(self,r,title,body):
+  if r.method=='POST':
+   for key,value in r.data.items():
+    if key not in ['name','surname','matricola','email','contact_email','username','whatsapp','faculty','subject','title','paragraph','outline','other_ateneo','body','description','amount','author','review_url','review_date','rating']:continue
+    body=re.sub(r'(<input\b[^>]*name="'+re.escape(key)+r'"[^>]*)(>)',lambda m:m[1]+' value="'+esc(value)+'"'+m[2],body)
+    body=re.sub(r'(<textarea\b[^>]*name="'+re.escape(key)+r'"[^>]*>)(.*?)(</textarea>)',lambda m:m[1]+esc(value)+m[3],body,flags=re.S)
+   selected=r.data.get('ateneo','')
+   if selected in ATENEI:body=body.replace('<option>'+selected+'</option>','<option selected>'+selected+'</option>')
+  if r.user:auth=f'<a href="/area">I miei progetti</a><form method="post" action="/logout" class="inline">{r.csrf()}<button class="text-button">Esci</button></form>'
+  elif self.ready:auth='<a href="/login">Accedi ai miei lavori</a><a class="button small" href="/registrati">Paragrafo gratuito <span aria-hidden="true">↗</span></a>'
+  else:auth=f'<a class="button small" href="{WHATSAPP}" target="_blank" rel="noopener">Consulenza gratuita <span aria-hidden="true">↗</span></a>'
+  return f'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>{esc(title)} · FormaTesi</title><meta name="description" content="Consulenza iniziale e un paragrafo dimostrativo gratuito sul tuo progetto di tesi."><link rel="icon" href="/static/favicon.svg"><link rel="stylesheet" href="/static/style.css"><script defer src="/static/app.js"></script></head><body><a class="skip" href="#main">Vai al contenuto</a><header><a class="brand" href="/" aria-label="FormaTesi, pagina iniziale"><span class="brand-icon"><img src="/static/formatesi-icon.webp" alt=""></span>Forma<span>Tesi</span></a><nav aria-label="Navigazione principale"><a class="desktop" href="/#come-funziona">Come funziona</a><a class="desktop" href="/#recensioni">Recensioni</a><a class="desktop" href="/#domande">Domande frequenti</a>{auth}</nav></header><main id="main">{body}</main><div class="contact-dock" aria-label="Contatti rapidi"><a class="dock-messenger" href="{MESSENGER}" target="_blank" rel="noopener" aria-label="Apri Messenger"><span aria-hidden="true">M</span><b>Messenger</b></a><a class="dock-whatsapp" href="{WHATSAPP}" target="_blank" rel="noopener" aria-label="Scrivi su WhatsApp al 350 581 5735"><span aria-hidden="true">☎</span><b>WhatsApp</b></a></div><footer><div><a class="brand" href="/"><span class="brand-icon"><img src="/static/formatesi-icon.webp" alt=""></span>Forma<span>Tesi</span></a><p>Un progetto alla volta.<br>Il tuo, al centro.</p></div><div><a href="{FB}" rel="noopener" target="_blank">Facebook ↗</a><a href="{FB_REVIEWS}" rel="noopener" target="_blank">Recensioni Facebook ↗</a><a href="{MESSENGER}" rel="noopener" target="_blank">Messenger ↗</a><a href="{WHATSAPP}" rel="noopener" target="_blank">WhatsApp ↗</a><a href="/privacy">Privacy</a><a href="/condizioni">Condizioni del servizio</a></div><p class="fine">Supporto alla ricerca e alla revisione accademica.<br>Servizio indipendente, non affiliato agli atenei indicati.<br>© {datetime.date.today().year} FormaTesi</p></footer></body></html>'''
+ def closed(self,r):return self.page(r,'Il tuo spazio',f'<section class="narrow panel"><span class="eyebrow">Il nuovo spazio FormaTesi</span><h1>Ci siamo quasi.</h1><p>Stiamo completando l’attivazione dell’area riservata. Nel frattempo puoi contattarci su Facebook per parlare del tuo progetto.</p><a class="button" href="{FB}">Contatta FormaTesi ↗</a><a class="secondary" href="/anteprima">Esplora l’area di esempio</a><p class="fine">Le registrazioni non sono ancora aperte. In questa anteprima non vengono raccolti dati personali.</p></section>'),503,[]
+ def route(self,r):
+  p=r.path
+  if p.startswith('/static/'):
+   name=p.split('/')[-1]
+   if name not in ['style.css','app.js','favicon.svg','formatesi-logo.webp','formatesi-icon.webp','laureati-formatesi.webp','tesi-laurea-formatesi.webp']:raise Failure('Pagina non trovata.',404)
+   return (ROOT/'static'/name).read_bytes(),200,[('Content-Type',{'css':'text/css','js':'application/javascript','svg':'image/svg+xml','webp':'image/webp'}[name.split('.')[-1]])]
+  if p=='/favicon.ico':return (ROOT/'static/favicon.svg').read_bytes(),200,[('Content-Type','image/svg+xml')]
+  if p=='/health':return json.dumps({'status':'ok','portal': 'active' if self.ready else 'setup_required'}),200,[('Content-Type','application/json')]
+  if p=='/robots.txt':return 'User-agent: *\nDisallow: /area\nDisallow: /lavori/\nDisallow: /gestione\nDisallow: /verifica\nDisallow: /reimposta\n',200,[('Content-Type','text/plain')]
+  if p=='/':return self.page(r,'La tua tesi comincia a prendere forma',public_landing(self.public_reviews(),self.ready)),200,[]
+  if p.startswith('/atenei/'):
+   slug=p.strip('/').split('/')[-1]
+   if slug not in ATENEI_PAGES:raise Failure('Ateneo non trovato.',404)
+   return self.page(r,'Supporto tesi '+ATENEI_PAGES[slug],university_page(slug,self.ready)),200,[]
+  if p=='/anteprima':return self.page(r,'Anteprima area personale',demo()),200,[]
+  if p in ['/privacy','/condizioni']:return self.page(r,'Informazioni',legal(self,p)),200,[]
+  if not self.ready:return self.closed(r)
+  r.load_session()
+  if r.method=='POST':r.check_csrf()
+  if p=='/facebook':return self.facebook_start(r)
+  if p=='/facebook/callback':return self.facebook_callback(r)
+  if p in ['/registrati','/login','/recupera','/reimposta','/verifica','/registrati-facebook']:return self.auth(r)
+  if not r.user:return self.redirect('/login')
+  if p=='/logout' and r.method=='POST':
+   self.mutate('DELETE FROM sessions WHERE id=?',(r.session['id'],));r.clear_cookie();return self.redirect('/')
+  if p=='/area':return self.dashboard(r)
+  if p in ['/account/email','/account/contatti'] and r.method=='POST':
+   if r.user['role']=='admin':raise Failure('Azione non disponibile.',403)
+   email=r.data.get('contact_email','').strip().lower()
+   if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Failure('Inserisci un indirizzo email valido.')
+   whatsapp=phone_number(r.data.get('whatsapp',''))
+   opt_in=1 if r.data.get('whatsapp_opt_in')=='yes' else 0
+   if r.data.get('whatsapp','') and not whatsapp:raise Failure('Controlla il numero WhatsApp, includendo il prefisso internazionale.')
+   if opt_in and not whatsapp:raise Failure('Inserisci il numero WhatsApp per attivare gli avvisi.')
+   self.mutate('UPDATE users SET contact_email=?,whatsapp=?,whatsapp_opt_in=? WHERE id=?',(email,whatsapp or None,opt_in,r.user['id']))
+   self.mail(email,'Notifiche FormaTesi attivate','Le notifiche del tuo account personale sono attive. Riceverai qui gli avvisi quando un lavoro o una revisione sarà disponibile.\n\nAccedi ai tuoi lavori: '+self.origin+'/login')
+   return self.redirect('/area')
+  if p=='/gestione/recensioni':return self.reviews_admin(r)
+  if p=='/gestione/notifiche':return self.notifications_admin(r)
+  if p=='/nuovo':return self.new_project(r)
+  if p=='/gestione/email' and r.method=='POST':
+   r.admin()
+   for m in self.query('SELECT * FROM outbox WHERE sent=0 ORDER BY created LIMIT 10'):self.send_mail(m['id'],m['email'],m['subject'],m['body'])
+   return self.redirect('/area')
+  if p.startswith('/file/'):
+   f=self.query('SELECT * FROM files WHERE id=?',(p.split('/')[-1],),True)
+   if not f:raise Failure('File non trovato.',404)
+   self.owned(r,f['project_id']);data=base64.b64decode(f['data'])
+   return data,200,[('Content-Type',f['mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(f['name']))]
+  if p.startswith('/pagamenti/') and p.endswith('/contabile'):
+   payment_id=p.strip('/').split('/')[1]
+   payment=self.query('SELECT * FROM payments WHERE id=?',(payment_id,),True)
+   if not payment or not payment.get('proof_data'):raise Failure('Contabile non trovata.',404)
+   self.owned(r,payment['project_id'])
+   return base64.b64decode(payment['proof_data']),200,[('Content-Type',payment['proof_mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(payment['proof_name']))]
+  if p.startswith('/lavori/'):
+   bits=p.strip('/').split('/');project=self.owned(r,bits[1]);action=bits[2] if len(bits)>2 else ''
+   if action=='riepilogo.docx':
+    r.admin();return self.project_summary_docx(project)
+   if r.method=='POST':return self.project_action(r,project,action)
+   return self.project_page(r,project)
+  raise Failure('Pagina non trovata.',404)
+ def notifications_admin(self,r):
+  r.admin()
+  if r.method=='POST':
+   message=self.query('SELECT * FROM outbox WHERE id=?',(r.data.get('notification'),),True)
+   if not message:raise Failure('Notifica non trovata.',404)
+   self.send_mail(message['id'],message['email'],message['subject'],message['body'])
+   return self.redirect('/gestione/notifiche')
+  rows=self.query('SELECT * FROM outbox ORDER BY created DESC LIMIT 100')
+  sent=sum(bool(x['sent']) for x in rows);pending=sum(not x['sent'] for x in rows)
+  cards=''
+  for item in rows:
+   state='<span class="badge success">Inviata</span>' if item['sent'] else '<span class="badge waiting">Da riprovare</span>'
+   retry='' if item['sent'] else f'<form method="post">{r.csrf()}<input type="hidden" name="notification" value="{item["id"]}"><button class="button small">Riprova invio</button></form>'
+   error=f'<p class="notification-error">{esc(item.get("last_error"))}</p>' if item.get('last_error') else ''
+   cards+=f'<article class="notification-card"><div><strong>{esc(item["subject"])}</strong>{state}</div><p>{esc(item["email"])}</p><small>Creata: {date(item["created"])} · Tentativi: {item.get("attempts") or 0}</small>{error}{retry}</article>'
+  if not cards:cards='<div class="empty compact"><p>Nessuna notifica registrata.</p></div>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Torna al pannello</a><div class="page-heading"><div><span class="eyebrow">CONTROLLO COMUNICAZIONI</span><h1>Notifiche email.</h1><p>Verifica consegne riuscite ed eventuali invii da ripetere.</p></div></div><div class="stats compact-stats"><div><strong>{sent}</strong><span>Inviate</span></div><div><strong>{pending}</strong><span>Da riprovare</span></div></div><div class="notification-list">{cards}</div></section>'
+  return self.page(r,'Notifiche email',body),200,[]
+ def public_reviews(self):
+  if not self.db:return []
+  return self.query('SELECT * FROM reviews WHERE published=1 ORDER BY review_date DESC,created DESC LIMIT 6')
+ def reviews_admin(self,r):
+  r.admin()
+  if r.method=='POST':
+   author=r.require('author',100);body=r.require('body',1200);url=r.require('review_url',600);review_date=r.require('review_date',10)
+   if not url.startswith('https://www.facebook.com/') and not url.startswith('https://facebook.com/'):raise Failure('Inserisci il collegamento originale della recensione Facebook.')
+   try:rating=int(r.data.get('rating','5'))
+   except ValueError:rating=0
+   if rating not in range(1,6) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',review_date):raise Failure('Controlla voto e data della recensione.')
+   self.mutate('INSERT INTO reviews VALUES(?,?,?,?,?,?,1,?)',(uid(),author,body,rating,url,review_date,now()));self.audit(r.user['id'],'review.published')
+   return self.redirect('/gestione/recensioni')
+  rows=self.query('SELECT * FROM reviews ORDER BY review_date DESC,created DESC')
+  cards=''.join(f'<article class="review-admin-card"><div><strong>{esc(x["author"])}</strong><span>{"★"*x["rating"]} · {esc(x["review_date"])}</span></div><p>{esc(x["body"])}</p><a href="{esc(x["review_url"])}" target="_blank" rel="noopener">Controlla su Facebook ↗</a></article>' for x in rows) or '<div class="empty compact"><p>Non hai ancora pubblicato recensioni.</p></div>'
+  form=f'<form method="post" class="panel review-form">{r.csrf()}<h2>Pubblica una recensione verificata</h2><p>Copia il testo esatto e incolla il collegamento alla recensione originale.</p><div class="grid two">{field("author","Nome visualizzato su Facebook")}{field("review_date","Data della recensione","date")}</div><label>Valutazione<select name="rating"><option value="5">5 stelle</option><option value="4">4 stelle</option><option value="3">3 stelle</option><option value="2">2 stelle</option><option value="1">1 stella</option></select></label><label>Testo della recensione<textarea name="body" rows="6" maxlength="1200" required></textarea></label>{field("review_url","Link diretto alla recensione","url")}<button class="button">Verifica e pubblica ↗</button></form>'
+  return self.page(r,'Gestione recensioni',f'<section class="workspace"><a class="back" href="/area">← Torna al pannello</a><div class="page-heading"><div><span class="eyebrow">FIDUCIA VERIFICABILE</span><h1>Recensioni Facebook.</h1><p>Solo testimonianze controllabili dalla fonte originale.</p></div><a class="button secondary" href="{FB_REVIEWS}" target="_blank" rel="noopener">Apri Facebook ↗</a></div><div class="review-admin-layout">{form}<div>{cards}</div></div></section>'),200,[]
+ def facebook_enabled(self):return bool(self.cfg.get('FACEBOOK_APP_ID') and self.cfg.get('FACEBOOK_APP_SECRET'))
+ def facebook_start(self,r):
+  if not self.facebook_enabled():raise Failure('L’accesso con Facebook sarà disponibile appena l’app FormaTesi verrà collegata a Meta.',503)
+  state=secrets.token_urlsafe(32);self.mutate('UPDATE sessions SET csrf=? WHERE id=?',(state,r.session['id']));r.session['csrf']=state
+  params={'client_id':self.cfg['FACEBOOK_APP_ID'],'redirect_uri':self.origin+'/facebook/callback','state':state,'scope':'email,public_profile','response_type':'code'}
+  return self.redirect('https://www.facebook.com/v23.0/dialog/oauth?'+urllib.parse.urlencode(params))
+ def facebook_callback(self,r):
+  if not self.facebook_enabled():raise Failure('Accesso Facebook non configurato.',503)
+  if r.q.get('error'):raise Failure('Accesso con Facebook annullato.')
+  if not r.session or not hmac.compare_digest(r.q.get('state',''),r.session['csrf']):raise Failure('La richiesta Facebook è scaduta. Riprova.',403)
+  code=r.q.get('code','')
+  if not code:raise Failure('Facebook non ha restituito un codice di accesso.')
+  try:
+   exchange=urllib.parse.urlencode({'client_id':self.cfg['FACEBOOK_APP_ID'],'client_secret':self.cfg['FACEBOOK_APP_SECRET'],'redirect_uri':self.origin+'/facebook/callback','code':code}).encode()
+   req=urllib.request.Request('https://graph.facebook.com/v23.0/oauth/access_token',data=exchange)
+   with urllib.request.urlopen(req,timeout=10) as response:token=json.loads(response.read())['access_token']
+   graph='https://graph.facebook.com/v23.0/me?'+urllib.parse.urlencode({'fields':'id,first_name,last_name,email','access_token':token})
+   with urllib.request.urlopen(graph,timeout=10) as response:profile=json.loads(response.read())
+  except Exception:raise Failure('Non è stato possibile completare l’accesso con Facebook. Riprova tra poco.',503)
+  if not profile.get('id') or not profile.get('email'):raise Failure('Facebook non ha fornito un indirizzo email. Registrati con email e password.')
+  email=profile['email'].lower();facebook_id=str(profile['id'])
+  existing=self.query('SELECT * FROM users WHERE facebook_id=? OR email=?',(facebook_id,email),True)
+  if existing:
+   self.mutate('UPDATE users SET facebook_id=?,verified=1 WHERE id=?',(facebook_id,existing['id']))
+   existing=self.query('SELECT * FROM users WHERE id=?',(existing['id'],),True);r.login(existing);return self.redirect('/area')
+  payload={'id':facebook_id,'name':profile.get('first_name',''),'surname':profile.get('last_name',''),'email':email,'exp':now()+600}
+  encoded=base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).decode().rstrip('=')
+  signature=hmac.new(self.cfg['FACEBOOK_APP_SECRET'].encode(),encoded.encode(),hashlib.sha256).hexdigest()
+  return self.redirect('/registrati-facebook?ticket='+urllib.parse.quote(encoded+'.'+signature))
+ def facebook_ticket(self,ticket):
+  try:
+   encoded,signature=ticket.split('.',1);expected=hmac.new(self.cfg['FACEBOOK_APP_SECRET'].encode(),encoded.encode(),hashlib.sha256).hexdigest()
+   if not hmac.compare_digest(signature,expected):raise ValueError()
+   payload=json.loads(base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4)))
+   if payload['exp']<now():raise ValueError()
+   return payload
+  except Exception:raise Failure('La registrazione Facebook è scaduta. Accedi nuovamente con Facebook.')
+ def owned(self,r,ident):
+  project=self.query('SELECT * FROM projects WHERE id=?',(ident,),True)
+  if not project or (project['user_id']!=r.user['id'] and r.user['role']!='admin'):raise Failure('Lavoro non trovato.',404)
+  return project
+ def auth(self,r):
+  p=r.path;error='';message=''
+  if self.code_mode and p in ['/registrati','/login','/recupera']:return self.code_auth(r)
+  if p=='/verifica':
+   token=self.query('SELECT * FROM tokens WHERE id=? AND kind=? AND expires>?',(digest(r.q.get('token','')),'verify',now()),True)
+   if not token:raise Failure('Link scaduto o già utilizzato. Puoi richiederne un altro dalla pagina di accesso.')
+   with self.db.connect() as c:
+    user=self.db.run(c,'SELECT * FROM users WHERE id=?',(token['user_id'],)).fetchone()
+    role='admin' if user['email'].lower()==self.cfg.get('ADMIN_EMAIL','').lower() else 'student'
+    self.db.run(c,'UPDATE users SET verified=1,role=? WHERE id=?',(role,user['id']))
+    self.db.run(c,'DELETE FROM tokens WHERE id=?',(token['id'],))
+   return self.page(r,'Email verificata','<section class="narrow panel"><h1>Email verificata.</h1><p>Il tuo account è pronto.</p><a class="button" href="/login">Accedi alla tua area</a></section>'),200,[]
+  if r.method=='POST':
+   self.limit('auth:'+r.ip,30)
+   try:
+    email=r.data.get('email','').strip().lower()
+    if p=='/registrati-facebook':
+     profile=self.facebook_ticket(r.data.get('ticket',''));email=profile['email'];matricola=r.require('matricola',150)
+     if r.data.get('terms')!='yes':raise Failure('Leggi e accetta le condizioni per continuare.')
+     existing=self.query('SELECT * FROM users WHERE facebook_id=? OR email=?',(profile['id'],email),True)
+     if existing:self.mutate('UPDATE users SET facebook_id=?,verified=1 WHERE id=?',(profile['id'],existing['id']));user=self.query('SELECT * FROM users WHERE id=?',(existing['id'],),True)
+     else:
+      ident=uid();self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,facebook_id) VALUES(?,?,?,?,?,?,1,?,?,?)',(ident,profile['name'],profile['surname'],email,password_hash(secrets.token_urlsafe(32)),matricola,'student',now(),profile['id']));user=self.query('SELECT * FROM users WHERE id=?',(ident,),True)
+     r.login(user);self.audit(user['id'],'facebook.registration');return self.redirect('/area')
+    if p!='/reimposta' and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Failure('Inserisci un indirizzo email valido.')
+    if p=='/registrati':
+     self.limit('register:'+r.ip,8,3600)
+     values=[r.require(k,150) for k in ['name','surname','matricola']];password=r.password()
+     if r.data.get('terms')!='yes':raise Failure('Leggi e accetta le condizioni per continuare.')
+     existing=self.query('SELECT * FROM users WHERE email=?',(email,),True)
+     if not existing:
+      ident=uid();self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,0,?,?)',(ident,*values[:2],email,password_hash(password),values[2],'student',now()))
+      existing=self.query('SELECT * FROM users WHERE id=?',(ident,),True)
+      raw=self.token(existing,'verify');self.mail(email,'Verifica il tuo account FormaTesi','Per verificare la tua email apri questo link entro un’ora: '+self.origin+'/verifica?token='+raw)
+     message='Se l’indirizzo può essere registrato, riceverai un’email per attivare l’account. Se hai già un account, accedi o recupera la password.'
+    elif p=='/login':
+     self.limit('login:'+email,10)
+     user=self.query('SELECT * FROM users WHERE email=?',(email,),True)
+     if not user or not password_ok(r.data.get('password',''),user['password']):raise Failure('Email o password non corrette.')
+     if not user['verified']:
+      raw=self.token(user,'verify');self.mail(email,'Verifica il tuo account FormaTesi',self.origin+'/verifica?token='+raw);raise Failure('Verifica la tua email prima di accedere. Ti abbiamo inviato un nuovo link.')
+     r.login(user);self.audit(user['id'],'login');return self.redirect('/area')
+    elif p=='/recupera':
+     self.limit('reset:'+email,3,3600);user=self.query('SELECT * FROM users WHERE email=?',(email,),True)
+     if user:
+      raw=self.token(user,'reset');self.mail(email,'Reimposta la password FormaTesi','Apri entro un’ora: '+self.origin+'/reimposta?token='+raw)
+     message='Se l’indirizzo è associato a un account, riceverai le istruzioni via email.'
+    elif p=='/reimposta':
+     token=self.query('SELECT * FROM tokens WHERE id=? AND kind=? AND expires>?',(digest(r.data.get('token','')),'reset',now()),True)
+     if not token:raise Failure('Link scaduto o non valido. Richiedi un nuovo link.')
+     password=r.password()
+     with self.db.connect() as c:
+      # Claim the one-time token inside the same transaction as the password change.
+      deleted=self.db.run(c,'DELETE FROM tokens WHERE id=?',(token['id'],)).rowcount
+      if not deleted:raise Failure('Link già utilizzato.')
+      self.db.run(c,'UPDATE users SET password=? WHERE id=?',(password_hash(password),token['user_id']))
+      self.db.run(c,'DELETE FROM sessions WHERE user_id=?',(token['user_id'],))
+     return self.page(r,'Password aggiornata','<section class="narrow panel"><h1>Password aggiornata.</h1><a class="button" href="/login">Accedi</a></section>'),200,[]
+   except Failure as e:error=e.message
+  title={'/registrati':'Il tuo progetto,\nil tuo spazio.','/login':'Bentornato.','/recupera':'Ritrova il tuo accesso.','/reimposta':'Una nuova password.','/registrati-facebook':'Completa il tuo profilo.'}[p]
+  fields=''
+  profile=None
+  if p=='/registrati-facebook':
+   try:profile=self.facebook_ticket(r.q.get('ticket',r.data.get('ticket','')))
+   except Failure as e:error=e.message
+   if profile:fields=f'<div class="facebook-profile"><span class="fb-mark">{SOCIAL_ICONS["facebook"]}</span><div><strong>{esc(profile["name"]+" "+profile["surname"])}</strong><span>{esc(profile["email"])}</span></div></div>'+field('matricola','Matricola universitaria')+f'<input type="hidden" name="ticket" value="{esc(r.q.get("ticket",r.data.get("ticket","")))}"><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa privacy</a> e accetto le <a href="/condizioni" target="_blank">condizioni del servizio</a>.</span></label>'
+  if p=='/registrati':fields='<div class="grid two">'+field('name','Nome',autocomplete='given-name')+field('surname','Cognome',autocomplete='family-name')+'</div>'+field('matricola','Matricola universitaria')
+  if p not in ['/reimposta','/registrati-facebook']:fields+=field('email','Email','email',autocomplete='email')
+  if p in ['/registrati','/login','/reimposta']:fields+=field('password','Password','password',autocomplete='current-password' if p=='/login' else 'new-password',extra='minlength="12"' if p!='/login' else '')
+  if p in ['/registrati','/reimposta']:fields+='<p class="fine">Almeno 12 caratteri. Puoi usare una frase facile da ricordare.</p>'
+  if p=='/registrati':fields+='<label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa privacy</a> e accetto le <a href="/condizioni" target="_blank">condizioni del servizio</a>.</span></label>'
+  if p=='/reimposta':fields+=f'<input type="hidden" name="token" value="{esc(r.q.get("token",r.data.get("token","")))}">'
+  label={'/registrati':'Crea il tuo account','/login':'Accedi','/recupera':'Invia il link','/reimposta':'Salva la password','/registrati-facebook':'Entra nella tua area'}[p]
+  facebook_button='' if p in ['/recupera','/reimposta','/registrati-facebook'] else f'<a class="facebook-login" href="/facebook"><span aria-hidden="true">{SOCIAL_ICONS["facebook"]}</span> Continua con Facebook</a><div class="form-divider"><span>oppure</span></div>'
+  body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">Il tuo spazio FormaTesi</span><h1>{esc(title).replace(chr(10),"<br>")}</h1><p>La tua richiesta, le consegne e ogni revisione. Tutto nello stesso posto.</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="status" class="notice">{esc(message)}</div>' if message else '')+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+facebook_button+f'<form method="post">{r.csrf()}{fields}<button class="button full">{label} ↗</button></form><div class="auth-links"><a href="/login">Accedi</a><a href="/registrati">Registrati</a><a href="/recupera">Password dimenticata?</a></div></div></section>'
+  return self.page(r,label,body),200,[]
+ def code_auth(self,r):
+  error=''
+  if r.method=='POST':
+   self.limit('code-auth:'+r.ip,20,3600)
+   try:
+    if r.path=='/recupera':
+     identifier=r.data.get('identifier','').strip()
+     user=self.query('SELECT * FROM users WHERE matricola=? OR username=? OR contact_email=?',(identifier.upper(),identifier.lower(),identifier.lower()),True)
+     if user and user.get('contact_email'):
+      raw=self.token(user,'reset');self.mail(user['contact_email'],'Reimposta la password FormaTesi','Apri questo collegamento entro un’ora per scegliere una nuova password: '+self.origin+'/reimposta?token='+raw)
+     body='<section class="narrow panel"><span class="eyebrow">RECUPERO ACCESSO</span><h1>Controlla la tua email.</h1><p>Se i dati inseriti corrispondono a un account, riceverai il collegamento per scegliere una nuova password.</p><a class="button" href="/login">Torna all’accesso</a></section>'
+     return self.page(r,'Recupera accesso',body),200,[]
+    password=r.password()
+    if r.path=='/registrati':
+     self.limit('code-register:'+r.ip,5,3600)
+     if r.data.get('terms')!='yes':raise Failure('Leggi e accetta l’informativa per continuare.')
+     contact=r.data.get('contact_email','').strip().lower()
+     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',contact):raise Failure('Inserisci un indirizzo email valido: serve per avvisarti quando il lavoro è pronto.')
+     whatsapp=phone_number(r.data.get('whatsapp',''))
+     opt_in=1 if r.data.get('whatsapp_opt_in')=='yes' else 0
+     if r.data.get('whatsapp','') and not whatsapp:raise Failure('Controlla il numero WhatsApp, includendo il prefisso internazionale.')
+     if opt_in and not whatsapp:raise Failure('Inserisci il numero WhatsApp per attivare gli avvisi.')
+     username=r.data.get('username','').strip().lower()
+     if username and not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,29}',username):raise Failure('Lo username deve avere da 3 a 30 caratteri e può contenere lettere, numeri, punto, trattino o trattino basso.')
+     if username and self.query('SELECT id FROM users WHERE username=?',(username,),True):raise Failure('Questo username è già utilizzato. Scegline un altro.')
+     while True:
+      code='FT-'+secrets.token_hex(2).upper()+'-'+secrets.token_hex(2).upper()
+      if not self.query('SELECT id FROM users WHERE matricola=?',(code,),True):break
+     ident=uid();internal=code.lower()+'@pratica.invalid'
+     self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email,username,whatsapp,whatsapp_opt_in) VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact,username or None,whatsapp or None,opt_in))
+     user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);r.login(user);self.audit(user['id'],'code.registration')
+     self.mail(contact,'Il tuo accesso personale FormaTesi','Conserva questo codice di accesso: '+code+'\n\nPer accedere ai tuoi progetti: '+self.origin+'/login')
+     username_note=f'<p><strong>Username:</strong> {esc(username)}</p>' if username else ''
+     body=f'''<section class="narrow panel code-success"><span class="eyebrow">IL TUO ACCOUNT PERSONALE</span><h1>Conserva le credenziali.</h1><p>Puoi entrare nei tuoi progetti con il codice di accesso oppure con lo username scelto.</p><div class="practice-code" aria-label="Codice di accesso">{esc(code)}</div>{username_note}<p class="notice">Ti abbiamo inviato anche una copia del codice via email. La stessa email riceverà gli avvisi sui materiali e sulle revisioni.</p><a class="button full" href="/nuovo">Richiedi la prova gratuita ↗</a></section>'''
+     return self.page(r,'Il tuo account personale',body),200,[]
+    identifier=r.data.get('identifier','').strip()
+    user=self.query('SELECT * FROM users WHERE matricola=? OR username=? OR email=?',(identifier.upper(),identifier.lower(),identifier.lower()),True)
+    if not user or not password_ok(password,user['password']):raise Failure('Codice di accesso, username o password non corretti.')
+    if '@' in identifier and user['role']!='admin':raise Failure('Per gli studenti è necessario usare il codice di accesso o lo username.')
+    r.login(user);self.audit(user['id'],'code.login');return self.redirect('/area')
+   except Failure as e:error=e.message
+  if r.path=='/registrati':
+   fields='<div class="wizard-progress" aria-label="Avanzamento registrazione"><span class="active">1 · ACCESSO</span><span>2 · CONTATTI</span><span>3 · CONFERMA</span></div><div class="wizard-step" data-step="1"><h2>Scegli come rientrare</h2>'+field('username','Scegli uno username (facoltativo)','text',autocomplete='username',required=False,placeholder='Es. studente2026')+'<p class="fine">Potrai usarlo al posto del codice di accesso generato automaticamente.</p>'+field('password','Scegli una password','password',autocomplete='new-password',extra='minlength="12"')+'<p class="fine">Usa almeno 12 caratteri. Non inserire dati personali nella password.</p><button class="button full wizard-next" type="button">Continua ai contatti ↗</button></div><div class="wizard-step" data-step="2"><h2>Dove ricevere gli avvisi</h2>'+field('contact_email','Email per ricevere gli avvisi','email',autocomplete='email',placeholder='La useremo per consegne e revisioni')+'<p class="fine">OBBLIGATORIA: QUI RICEVERAI LA CONFERMA E L’AVVISO QUANDO IL LAVORO È PRONTO.</p>'+field('whatsapp','Numero WhatsApp (facoltativo)','tel',autocomplete='tel',required=False,placeholder='Es. +39 350 123 4567')+'<label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label><div class="wizard-actions"><button class="button secondary wizard-back" type="button">Indietro</button><button class="button wizard-next" type="button">Continua ↗</button></div></div><div class="wizard-step" data-step="3"><h2>Conferma il tuo account</h2><div class="confirmation-card"><strong>Nessun pagamento</strong><p>Creeremo il tuo spazio personale e ti mostreremo subito il codice da conservare.</p></div><label class="check"><input type="checkbox" name="terms" value="yes" required> <span>Ho letto l’<a href="/privacy" target="_blank">informativa dell’account personale</a> e accetto le <a href="/condizioni" target="_blank">condizioni</a>.</span></label><div class="wizard-actions"><button class="button secondary wizard-back" type="button">Indietro</button><button class="button">Crea il mio account ↗</button></div></div>'
+   title='Crea il tuo account.<br>Segui i tuoi progetti.';intro='Riceverai un codice di accesso e le notifiche via email per ogni nuovo materiale o revisione.';label='Crea il mio account'
+  elif r.path=='/login':
+   fields=field('identifier','Codice di accesso o username','text',autocomplete='username',placeholder='FT-XXXX-XXXX oppure il tuo username')+field('password','Password','password',autocomplete='current-password')
+   title='Accedi ai<br>tuoi progetti.';intro='Inserisci il codice di accesso oppure lo username, poi la password.';label='Accedi ai miei progetti'
+  else:
+   fields=field('identifier','Codice, username o email per gli avvisi','text',autocomplete='username',placeholder='Inserisci uno dei dati collegati al tuo account')
+   title='Recupera il tuo<br>accesso.';intro='Ti invieremo un collegamento sicuro all’email associata all’account.';label='Invia il collegamento'
+  submit='' if r.path=='/registrati' else f'<button class="button full">{label} ↗</button>'
+  wizard=' data-wizard' if r.path=='/registrati' else ''
+  body=f'<section class="auth-layout"><div class="auth-intro"><span class="eyebrow">ACCOUNT PERSONALE</span><h1>{title}</h1><p>{intro}</p><div class="line-art">F<span>orma.</span></div></div><div class="panel">'+(f'<div role="alert" class="notice error">{esc(error)}</div>' if error else '')+f'<form method="post"{wizard}>{r.csrf()}{fields}{submit}</form><div class="auth-links"><a href="/login">Accedi ai miei lavori</a><a href="/registrati">Crea il mio account</a><a href="/recupera">Password dimenticata?</a></div></div></section>'
+  return self.page(r,label,body),200,[]
+ def dashboard(self,r):
+  admin=r.user['role']=='admin';status=r.q.get('stato','');search=r.q.get('q','').strip()
+  projects=self.query('SELECT p.*,u.name,u.surname,u.email,u.contact_email,u.username,u.matricola,u.whatsapp FROM projects p JOIN users u ON u.id=p.user_id '+('' if admin else 'WHERE p.user_id=? ')+'ORDER BY p.updated DESC',() if admin else (r.user['id'],))
+  if admin:
+   rank={'urgent':0,'high':1,'normal':2}
+   projects.sort(key=lambda p:(rank.get(p.get('priority'),2),p.get('due_at') or 9999999999,-p['updated']))
+  counts={k:sum(p['status']==k for p in projects) for k in STATUS}
+  filtered=[p for p in projects if (not status or p['status']==status) and (not search or normal(search) in normal(' '.join(str(p.get(k) or '') for k in ['title','name','surname','ateneo','username','matricola','contact_email','whatsapp'])))]
+  cards=''.join(project_card(p,admin) for p in filtered) or '<div class="empty"><span class="empty-icon">↗</span><h2>'+('Nessun lavoro trovato.' if search or status else 'Il tuo prossimo passo comincia qui.')+'</h2><p>'+('Prova a cambiare i filtri.' if search or status else 'Raccontaci la tua tesi per richiedere il primo lavoro.')+'</p>'+('' if admin else '<a class="button" href="/nuovo">Crea la tua richiesta</a>')+'</div>'
+  filters=''.join(f'<a class="filter {"selected" if status==k else ""}" href="/area?stato={k}">{v} <b>{counts[k]}</b></a>' for k,v in STATUS.items())
+  mail=''
+  if admin:
+   pending=self.query('SELECT COUNT(*) AS n FROM outbox WHERE sent=0',one=True)['n']
+   if pending:mail=f'<div class="notice">{pending} notifiche email in attesa di invio.<form method="post" action="/gestione/email">{r.csrf()}<button class="text-button">Riprova gli invii</button></form></div>'
+  elif not (r.user.get('contact_email') or (not r.user['email'].endswith('@pratica.invalid') and r.user['email'])):
+   mail=f'<div class="notice"><strong>ATTIVA LE NOTIFICHE OBBLIGATORIE.</strong><p>Inserisci l’email sulla quale vuoi ricevere gli avvisi quando un lavoro è pronto.</p><form method="post" action="/account/email">{r.csrf()}{field("contact_email","Email per le notifiche","email",autocomplete="email")}<button class="button">Attiva le notifiche</button></form></div>'
+  if not admin:
+   current_email=r.user.get('contact_email') or (r.user['email'] if not r.user['email'].endswith('@pratica.invalid') else '')
+   checked=' checked' if r.user.get('whatsapp_opt_in') else ''
+   contacts=f'<details class="panel contact-settings"><summary>Gestisci email e WhatsApp</summary><form method="post" action="/account/contatti">{r.csrf()}<label>Email per le notifiche<input name="contact_email" type="email" required autocomplete="email" value="{esc(current_email)}"></label><label>Numero WhatsApp (facoltativo)<input name="whatsapp" type="tel" autocomplete="tel" value="{esc(r.user.get("whatsapp"))}" placeholder="Es. +39 350 123 4567"></label><label class="check"><input type="checkbox" name="whatsapp_opt_in" value="yes"{checked}> <span>Desidero ricevere comunicazioni relative ai miei lavori anche su WhatsApp.</span></label><button class="button">Salva i contatti</button></form></details>'
+   mail+=contacts
+  actions='<div class="admin-actions"><a class="button" href="/gestione/notifiche">Controlla notifiche</a><a class="button secondary" href="/gestione/recensioni">Gestisci recensioni</a></div>' if admin else '<a class="button" href="/nuovo">Richiedi un nuovo lavoro +</a>'
+  insights=''
+  if admin:
+   students=self.query("SELECT COUNT(*) AS n FROM users WHERE role='student'",one=True)['n']
+   deliveries=self.query("SELECT COUNT(*) AS n FROM events WHERE kind='delivery'",one=True)['n']
+   accepted=self.query("SELECT COUNT(*) AS n FROM quotes WHERE status='accepted'",one=True)['n']
+   urgent=sum(p.get('priority')=='urgent' for p in projects)
+   insights=f'<section class="manager-overview"><div><strong>{students}</strong><span>Account studenti</span></div><div><strong>{len(projects)}</strong><span>Richieste ricevute</span></div><div><strong>{deliveries}</strong><span>Consegne pubblicate</span></div><div><strong>{accepted}</strong><span>Proposte accettate</span></div><div class="urgent-metric"><strong>{urgent}</strong><span>Lavori urgenti</span></div></section>'
+  body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}{insights}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
+  return self.page(r,'I miei lavori' if not admin else 'Gestione lavori',body),200,[]
+ def new_project(self,r):
+  error=''
+  if not (r.user.get('contact_email') or (not r.user['email'].endswith('@pratica.invalid') and r.user['email'])):raise Failure('Prima di richiedere un lavoro, attiva l’email per le notifiche dal tuo account personale.',409)
+  used=self.query('SELECT id FROM projects WHERE user_id=? AND free=1',(r.user['id'],),True)
+  if r.method=='POST':
+   try:
+    self.limit('projects:'+r.user['id'],10,3600)
+    ateneo=r.require('ateneo',150)
+    if ateneo=='Altro ateneo':ateneo=r.require('other_ateneo',150)
+    faculty=r.require('faculty',250);subject=r.require('subject',250);title=r.require('title',500)
+    outline=r.data.get('outline','').strip();paragraph=r.data.get('paragraph','').strip()
+    if max(len(outline),len(paragraph))>20000:raise Failure('Il testo inserito è troppo lungo.')
+    attachment=r.attachment()
+    if not outline and not paragraph and not attachment:raise Failure('Inserisci l’indice, carica il relativo file oppure indica il titolo del paragrafo.')
+    if used and r.data.get('paid')!='yes':raise Failure('Hai già richiesto la prova gratuita. Puoi inviare una richiesta di preventivo.')
+    ident=uid();identity=digest(normal(ateneo)+'|'+normal(r.user['matricola']))
+    with self.db.connect() as c:
+     self.db.run(c,'INSERT INTO projects(id,user_id,ateneo,faculty,subject,title,outline,paragraph,status,revision,free,identity_key,created,updated) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now()))
+     if attachment:self.save_file(c,ident,None,attachment)
+    self.audit(r.user['id'],'project.created:'+ident)
+    project=self.query('SELECT * FROM projects WHERE id=?',(ident,),True)
+    self.notify_admin(project,'Nuova richiesta di consulenza FormaTesi','È arrivata una nuova richiesta da valutare.')
+    self.notify(project,'Abbiamo ricevuto la tua richiesta FormaTesi','La tua richiesta è arrivata correttamente. Ti avviseremo via email non appena il primo lavoro sarà disponibile nella tua area personale.')
+    return self.redirect('/lavori/'+ident)
+   except Failure as e:error=e.message
+  options='<option value="">Scegli il tuo ateneo</option>'+''.join(f'<option>{esc(x)}</option>' for x in ATENEI)
+  form=f'''<form method="post" class="project-form" data-upload>{r.csrf()}<div class="section-label">01 <span>Il tuo percorso</span></div><label>Ateneo<select name="ateneo" required id="ateneo">{options}</select></label><div id="other-ateneo" hidden>{field('other_ateneo','Nome dell’ateneo',required=False)}</div>{field('faculty','Facoltà / corso di laurea',placeholder='Es. Scienze dell’educazione · L-19')}{field('subject','Materia',placeholder='Es. Pedagogia generale')}<div class="section-label">02 <span>Il tuo progetto</span></div>{field('title','Titolo della tesi',placeholder='Anche provvisorio')}<label>Indice della tesi<textarea name="outline" rows="5" maxlength="20000" placeholder="Incolla qui l’indice, se disponibile…"></textarea></label><label>Oppure carica l’indice<input type="file" id="attachment" accept=".pdf,.docx,.txt"><span class="fine">PDF, Word (.docx) o TXT · massimo 5 MB. Evita dati personali non necessari.</span></label><input type="hidden" name="file_name"><input type="hidden" name="file_data">{field('paragraph','Titolo del paragrafo',required=False,placeholder='Indica il paragrafo da cui iniziare')}<p class="fine">Serve almeno l’indice (testo o file) oppure il titolo del paragrafo.</p>'''
+  if used:form+='<div class="notice">La tua prova gratuita è già stata richiesta. Questa nuova richiesta serve a ricevere un preventivo.</div><label class="check"><input type="checkbox" name="paid" value="yes" required> Richiedo un preventivo senza impegno.</label>'
+  form+='<button class="button full">'+('Richiedi un preventivo' if used else 'Invia la richiesta gratuita')+' ↗</button><p class="fine" data-upload-status role="status">Nessun pagamento richiesto in questa fase.</p></form>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Torna ai tuoi lavori</a><div class="page-heading"><div><span class="eyebrow">Un nuovo inizio</span><h1>Parlaci della tua tesi.</h1><p>Le informazioni giuste per un primo lavoro su misura.</p></div></div><div class="form-layout"><div class="panel">'+(f'<p class="notice error" role="alert">{esc(error)}</p>' if error else '')+form+'</div><aside><div class="document" id="cover"><div class="doc-university" data-preview="ateneo">Il tuo ateneo</div><div class="doc-rule"></div><p data-preview="faculty">Il tuo corso di laurea</p><span class="doc-kicker">TESI DI LAUREA</span><h2 data-preview="title">Il titolo della tua tesi prende forma qui.</h2><p data-preview="subject">La tua materia</p><div class="doc-bottom">'+esc(r.user['name']+' '+r.user['surname'])+'</div></div><p class="fine">Anteprima orientativa, non frontespizio ufficiale dell’ateneo.</p><div class="aside-note"><h3>E dopo l’invio?</h3><p>Valutiamo il materiale e prepariamo il primo lavoro. Troverai la consegna nella tua area e riceverai un avviso via email.</p></div></aside></div></section>'
+  return self.page(r,'Nuova richiesta',body),200,[]
+ def save_file(self,c,project,event,attachment):
+  name,mime,data=attachment;self.db.run(c,'INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(uid(),project,event,name,mime,base64.b64encode(data).decode(),hashlib.sha256(data).hexdigest(),now()))
+ def project_action(self,r,p,action):
+  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento']:raise Failure('Azione non valida.',404)
+  if action in ['consegna','preventivo','organizza','conferma-pagamento']:r.admin()
+  elif r.user['id']!=p['user_id']:raise Failure('Questa azione è riservata allo studente.',403)
+  if action=='consegna':
+   recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
+   if not (recipient.get('contact_email') or (not recipient['email'].endswith('@pratica.invalid') and recipient['email'])):raise Failure('La consegna non può essere pubblicata finché lo studente non attiva l’email per le notifiche.',409)
+  with self.db.connect() as c:
+   locked=self.db.run(c,'SELECT * FROM projects WHERE id=?'+(' FOR UPDATE' if self.db.pg else ''),(p['id'],)).fetchone();p=dict(locked)
+   if action in ['consegna','revisione']:
+    submitted=int(r.data.get('version','-1'))
+    if submitted!=p['revision'] or r.data.get('status')!=p['status']:raise Failure('Il lavoro è stato aggiornato. Ricarica la pagina prima di continuare.',409)
+    body=r.data.get('body','').strip()
+    if len(body)>100000:raise Failure('Il testo supera il limite consentito.')
+    attachment=r.attachment()
+    if action=='revisione':
+     if p['status'] not in ['delivered','revised']:raise Failure('Puoi richiedere una revisione dopo una consegna.',409)
+     if not body:raise Failure('Spiega quali modifiche desideri.')
+     status='revision_requested';revision=p['revision'];kind='revision_request'
+    else:
+     if p['status'] not in ['waiting','revision_requested']:raise Failure('La consegna è già stata pubblicata. Attendi una richiesta di revisione.',409)
+     if not body and not attachment:raise Failure('Inserisci il testo oppure allega il documento da consegnare.')
+     revision=0 if p['status']=='waiting' else p['revision']+1;status='delivered' if revision==0 else 'revised';kind='delivery'
+    eid=uid();self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(eid,p['id'],r.user['id'],kind,body,revision,now()))
+    if attachment:self.save_file(c,p['id'],eid,attachment)
+    self.db.run(c,'UPDATE projects SET status=?,revision=?,updated=? WHERE id=?',(status,revision,now(),p['id']))
+   elif action=='preventivo':
+    description=r.require('description',10000)
+    value=r.require('amount',20).replace(',','.')
+    from decimal import Decimal,InvalidOperation
+    try:
+     amount=Decimal(value)
+     if not amount.is_finite() or amount<=0 or amount>100000 or amount.as_tuple().exponent < -2:raise InvalidOperation()
+     cents=int(amount*100)
+    except InvalidOperation:raise Failure('Inserisci un importo valido, con al massimo due decimali.')
+    if self.db.run(c,'SELECT id FROM quotes WHERE project_id=? AND status=?',(p['id'],'accepted')).fetchone():raise Failure('Esiste già una proposta accettata per questo lavoro.',409)
+    self.db.run(c,'UPDATE quotes SET status=? WHERE project_id=? AND status=?',('superseded',p['id'],'proposed'))
+    self.db.run(c,'INSERT INTO quotes VALUES(?,?,?,?,?,?,NULL)',(uid(),p['id'],description,cents,'proposed',now()))
+   elif action=='accetta':
+    if r.data.get('confirm')!='yes':raise Failure('Conferma di aver letto la proposta.')
+    changed=self.db.run(c,'UPDATE quotes SET status=?,accepted=? WHERE id=? AND project_id=? AND status=?',('accepted',now(),r.data.get('quote'),p['id'],'proposed')).rowcount
+    if not changed:raise Failure('La proposta è già stata aggiornata. Ricarica la pagina.',409)
+    quote=self.db.run(c,'SELECT * FROM quotes WHERE id=?',(r.data.get('quote'),)).fetchone();stamp=now()
+    self.db.run(c,'INSERT INTO payments(id,quote_id,project_id,expected_cents,received_cents,status,created,updated) VALUES(?,?,?,?,0,?,?,?)',(quote['id'],quote['id'],p['id'],quote['cents'],'pending',stamp,stamp))
+    self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'support_started','Percorso di affiancamento e revisione confermato.',p['revision'],now()))
+    self.db.run(c,'UPDATE projects SET status=?,updated=? WHERE id=?',('revision_requested',now(),p['id']))
+   elif action=='richiedi-preventivo':
+    if not self.db.run(c,'SELECT id FROM events WHERE project_id=? AND kind=?',(p['id'],'quote_request')).fetchone():self.db.run(c,'INSERT INTO events VALUES(?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'quote_request','Richiesto un preventivo per proseguire.',p['revision'],now()))
+   elif action=='organizza':
+    priority=r.data.get('priority','normal')
+    if priority not in ['normal','high','urgent']:raise Failure('Priorità non valida.')
+    due_at=None
+    if r.data.get('due_date'):
+     try:due_at=int(datetime.datetime.strptime(r.data['due_date'],'%Y-%m-%d').replace(tzinfo=datetime.timezone.utc).timestamp())
+     except ValueError:raise Failure('Controlla la data di scadenza.')
+    note=r.data.get('manager_note','').strip()
+    if len(note)>2000:raise Failure('La nota interna è troppo lunga.')
+    self.db.run(c,'UPDATE projects SET priority=?,due_at=?,manager_note=?,updated=? WHERE id=?',(priority,due_at,note,now(),p['id']))
+   elif action=='pagamento':
+    payment=self.db.run(c,'SELECT * FROM payments WHERE id=? AND project_id=?',(r.data.get('payment'),p['id'])).fetchone()
+    if not payment:raise Failure('Pagamento non trovato.',404)
+    transaction=r.data.get('transaction_ref','').strip();note=r.data.get('student_note','').strip();method=r.data.get('payment_method','bonifico')
+    if method not in ['bonifico','altro']:raise Failure('Metodo di pagamento non valido.')
+    if len(transaction)>150 or len(note)>1000:raise Failure('Le informazioni sul pagamento sono troppo lunghe.')
+    proof=r.payment_attachment()
+    if not transaction and not proof:raise Failure('Inserisci il numero della transazione oppure carica la contabile.')
+    values=(proof[0],proof[1],base64.b64encode(proof[2]).decode(),hashlib.sha256(proof[2]).hexdigest()) if proof else (payment['proof_name'],payment['proof_mime'],payment['proof_data'],payment['proof_sha'])
+    status=payment['status'] if payment['status'] in ['paid','partial'] else 'proof_submitted'
+    self.db.run(c,'UPDATE payments SET status=?,method=?,transaction_ref=?,proof_name=?,proof_mime=?,proof_data=?,proof_sha=?,student_note=?,updated=? WHERE id=?',(status,method,transaction,*values,note,now(),payment['id']))
+   elif action=='conferma-pagamento':
+    payment=self.db.run(c,'SELECT * FROM payments WHERE id=? AND project_id=?',(r.data.get('payment'),p['id'])).fetchone()
+    if not payment:raise Failure('Pagamento non trovato.',404)
+    received=parse_euros(r.require('received_amount',20),allow_zero=True);note=r.data.get('manager_note','').strip();method=r.data.get('payment_method',payment['method'] or 'bonifico')
+    if method not in ['bonifico','altro']:raise Failure('Metodo di pagamento non valido.')
+    if len(note)>1000:raise Failure('La nota del gestore è troppo lunga.')
+    status='paid' if received>=payment['expected_cents'] else ('partial' if received>0 else ('proof_submitted' if payment['proof_data'] or payment['transaction_ref'] else 'pending'))
+    self.db.run(c,'UPDATE payments SET received_cents=?,status=?,method=?,manager_note=?,updated=?,confirmed=? WHERE id=?',(received,status,method,note,now(),now(),payment['id']))
+  self.audit(r.user['id'],action+':'+p['id'])
+  updated=self.query('SELECT * FROM projects WHERE id=?',(p['id'],),True)
+  if action=='consegna':
+   if updated['revision']==0:self.notify(updated,'Il tuo primo lavoro FormaTesi è pronto','Abbiamo pubblicato il primo paragrafo o capitolo richiesto. Puoi leggerlo e scaricare gli eventuali allegati dalla tua area personale.')
+   else:self.notify(updated,'La revisione n. '+str(updated['revision'])+' è pronta','Abbiamo pubblicato la revisione n. '+str(updated['revision'])+'. La nuova versione e quelle precedenti restano disponibili nella tua area personale.')
+  elif action=='preventivo':self.notify(updated,'Hai ricevuto una proposta FormaTesi','La proposta personalizzata per proseguire è disponibile nella tua area personale. Potrai leggerla prima di confermare il tuo interesse.')
+  elif action=='revisione':self.notify_admin(updated,'Nuova richiesta di revisione FormaTesi','Lo studente ha inviato indicazioni per una revisione del lavoro.')
+  elif action=='richiedi-preventivo':self.notify_admin(updated,'Richiesta di preventivo FormaTesi','Lo studente desidera ricevere una proposta per continuare il lavoro.')
+  elif action=='accetta':
+   self.notify_admin(updated,'Percorso FormaTesi confermato','Lo studente ha accettato la proposta di affiancamento e revisione. Il progetto è ora pronto per il materiale successivo.')
+   self.notify(updated,'Il tuo percorso FormaTesi è attivo','Hai confermato la proposta. Da ora seguirai nell’area personale i materiali di supporto, gli aggiornamenti e le revisioni numerate.')
+  elif action=='pagamento':self.notify_admin(updated,'Pagamento comunicato da uno studente FormaTesi','Lo studente ha inserito una contabile o un numero di transazione. Verifica il pagamento dal pannello gestore prima di segnarlo come ricevuto.')
+  elif action=='conferma-pagamento':
+   payment=self.query('SELECT * FROM payments WHERE id=?',(r.data.get('payment'),),True);label='pagamento completo' if payment['status']=='paid' else ('pagamento parziale' if payment['status']=='partial' else 'pagamento da completare')
+   self.notify(updated,'Aggiornamento pagamento FormaTesi','Il gestore ha aggiornato il tuo pagamento: '+label+'. Importo ricevuto e residuo sono visibili nella tua area personale.')
+  return self.redirect('/lavori/'+p['id'])
+ def project_summary_docx(self,p):
+  student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True)
+  files=self.query('SELECT name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
+  payments=self.query('SELECT * FROM payments WHERE project_id=? ORDER BY created',(p['id'],))
+  doc=Document();section=doc.sections[0];section.page_width=Inches(8.5);section.page_height=Inches(11)
+  section.top_margin=section.bottom_margin=Inches(.75);section.left_margin=section.right_margin=Inches(.8)
+  styles=doc.styles;styles['Normal'].font.name='Aptos';styles['Normal'].font.size=Pt(11)
+  title=doc.add_paragraph();title.alignment=WD_ALIGN_PARAGRAPH.CENTER;title_run=title.add_run('Riepilogo lavoro FormaTesi');title_run.bold=True;title_run.font.size=Pt(26);title_run.font.color.rgb=None
+  subtitle=doc.add_paragraph('Scheda riservata al gestore');subtitle.alignment=WD_ALIGN_PARAGRAPH.CENTER
+  def section_table(heading,rows):
+   doc.add_heading(heading,level=1);table=doc.add_table(rows=0,cols=2);table.style='Table Grid'
+   for label,value in rows:
+    cells=table.add_row().cells;cells[0].text=label;cells[1].text=str('Non indicato' if value is None or value=='' else value);cells[0].paragraphs[0].runs[0].bold=True
+   doc.add_paragraph()
+  email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+  section_table('Studente e contatti',[('Codice di accesso',student['matricola']),('Username',student.get('username')),('Nome e cognome',(student['name']+' '+student['surname']) if student['name']!='Studente' else 'Non raccolti'),('Email',email),('WhatsApp',student.get('whatsapp')),('Consenso comunicazioni WhatsApp','Sì' if student.get('whatsapp_opt_in') else 'No')])
+  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Priorità',{'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')),('Scadenza interna',date(p['due_at']) if p.get('due_at') else 'Non impostata'),('Nota riservata al gestore',p.get('manager_note')),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
+  for index,payment in enumerate(payments,1):
+   labels={'pending':'In attesa di pagamento','proof_submitted':'Comunicata, da verificare','partial':'Pagamento parziale','paid':'Pagato'}
+   section_table('Pagamento '+str(index),[('Stato',labels.get(payment['status'],payment['status'])),('Importo previsto','€ '+money(payment['expected_cents'])),('Importo ricevuto e verificato','€ '+money(payment['received_cents'])),('Residuo','€ '+money(max(0,payment['expected_cents']-payment['received_cents']))),('Metodo',payment['method']),('Numero transazione',payment['transaction_ref']),('Contabile caricata',payment['proof_name']),('Nota dello studente',payment['student_note']),('Nota riservata del gestore',payment['manager_note'])])
+  doc.add_heading('Indice o indicazioni iniziali',level=1);doc.add_paragraph(p['outline'] or 'Non inserito come testo.')
+  doc.add_heading('File caricati',level=1)
+  if files:
+   for item in files:doc.add_paragraph(item['name'],style='List Bullet')
+  else:doc.add_paragraph('Nessun file caricato.')
+  doc.add_paragraph('Documento generato dal pannello riservato FormaTesi.').italic=True
+  output=io.BytesIO();doc.save(output);data=output.getvalue();filename='riepilogo-formatesi-'+p['id'][:8]+'.docx'
+  return data,200,[('Content-Type','application/vnd.openxmlformats-officedocument.wordprocessingml.document'),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(filename))]
+ def project_page(self,r,p):
+  admin=r.user['role']=='admin';events=self.query('SELECT * FROM events WHERE project_id=? ORDER BY created,id',(p['id'],));files=self.query('SELECT id,event_id,name FROM files WHERE project_id=? ORDER BY created',(p['id'],))
+  quotes=self.query('SELECT * FROM quotes WHERE project_id=? ORDER BY created DESC',(p['id'],))
+  payments=self.query('SELECT * FROM payments WHERE project_id=? ORDER BY created DESC',(p['id'],))
+  student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True)
+  history=''
+  for e in events:
+   if e['kind']=='delivery':label='Prova metodologica' if e['revision']==0 else 'Revisione n. '+str(e['revision'])
+   elif e['kind']=='revision_request':label='Richiesta di revisione'
+   elif e['kind']=='support_started':label='Affiancamento attivato'
+   else:label='Richiesta di proposta'
+   history+=f'<article class="timeline-item"><div class="event-heading"><h3>{label}</h3><time>{date(e["created"])}</time></div><div class="prose">{esc(e["body"])}</div>'+''.join(file_link(f) for f in files if f['event_id']==e['id'])+'</article>'
+  if not history:history='<div class="empty compact"><h3>La richiesta è arrivata.</h3><p>Qui compariranno la prima consegna e le successive revisioni.</p></div>'
+  warnings=''
+  if admin:
+   others=self.query('SELECT p.*,u.name,u.surname FROM projects p JOIN users u ON u.id=p.user_id WHERE p.id<>?',(p['id'],))
+   current_sha={x['sha'] for x in self.query('SELECT sha FROM files WHERE project_id=?',(p['id'],))}
+   from difflib import SequenceMatcher
+   matches=[]
+   for other in others:
+    reasons=[]
+    if other['identity_key']==p['identity_key']:reasons.append('stesso ateneo e matricola')
+    if SequenceMatcher(None,normal(other['title']),normal(p['title'])).ratio()>.85:reasons.append('titolo simile')
+    if p['outline'] and other['outline'] and SequenceMatcher(None,normal(p['outline']),normal(other['outline'])).ratio()>.85:reasons.append('indice simile')
+    if current_sha and current_sha.intersection(x['sha'] for x in self.query('SELECT sha FROM files WHERE project_id=?',(other['id'],))):reasons.append('allegato identico')
+    if reasons:matches.append(f'<li><a href="/lavori/{other["id"]}">{esc(other["name"]+" "+other["surname"])}</a>: {esc(", ".join(reasons))}</li>')
+   if matches:warnings='<div class="notice"><strong>Verifica possibili duplicati prima di lavorare</strong><ul>'+''.join(matches)+'</ul><p>Una somiglianza non dimostra che si tratti della stessa persona.</p></div>'
+  editor=''
+  can_deliver=admin and p['status'] in ['waiting','revision_requested'];can_request=not admin and p['status'] in ['delivered','revised']
+  if can_deliver or can_request:
+   action='consegna' if can_deliver else 'revisione';label='Pubblica il materiale' if can_deliver else 'Richiedi una revisione'
+   editor=f'<section class="panel"><h2>{label}</h2><form method="post" action="/lavori/{p["id"]}/{action}" data-upload>{r.csrf()}<input type="hidden" name="version" value="{p["revision"]}"><input type="hidden" name="status" value="{p["status"]}"><label>{"Nota di accompagnamento" if can_deliver else "Quali modifiche servono?"}<textarea name="body" rows="9" maxlength="100000" {"" if can_deliver else "required"}></textarea></label><label>{"Materiale da pubblicare" if can_deliver else "Osservazioni del relatore o altro allegato"}<input type="file" id="attachment" accept=".pdf,.docx,.txt"></label><p class="fine">PDF, DOCX o TXT · massimo 5 MB</p><input type="hidden" name="file_name"><input type="hidden" name="file_data"><button class="button">{label}</button><p role="status" data-upload-status></p></form></section>'
+  proposal=''
+  for q in quotes:
+   proposal+=f'<article class="quote"><span class="eyebrow">{"Proposta precedente" if q["status"]=="superseded" else "La tua proposta"}</span><h2>€ {money(q["cents"])}</h2><div class="prose">{esc(q["description"])}</div>'
+   if q['status']=='accepted':proposal+='<p class="badge success">Percorso confermato il '+date(q['accepted'])+'</p><p class="fine">Il percorso riguarda affiancamento metodologico, revisione e materiali di supporto. Nessun pagamento viene effettuato sul sito.</p>'
+   elif q['status']=='proposed' and not admin:proposal+=f'<form method="post" action="/lavori/{p["id"]}/accetta">{r.csrf()}<input type="hidden" name="quote" value="{q["id"]}"><label class="check"><input type="checkbox" name="confirm" value="yes" required> Ho letto la proposta e desidero essere contattato per procedere.</label><button class="button">Conferma interesse</button><p class="fine">Questa conferma non addebita importi e non conclude un acquisto.</p></form>'
+   proposal+='</article>'
+  if admin:proposal+=f'<details class="panel"><summary>Prepara un preventivo</summary><form method="post" action="/lavori/{p["id"]}/preventivo">{r.csrf()}{field("amount","Importo complessivo in euro",extra="inputmode=decimal")}<label>Cosa comprende, tempi e revisioni incluse<textarea name="description" rows="6" required maxlength="10000"></textarea></label><button class="button">Invia la proposta</button></form></details>'
+  elif not quotes:proposal+=f'<section class="panel"><h3>Vuoi proseguire insieme?</h3><p>Richiedi una proposta per un percorso personalizzato di affiancamento e revisione.</p><form method="post" action="/lavori/{p["id"]}/richiedi-preventivo">{r.csrf()}<button class="button">Richiedi una proposta</button></form></section>'
+  payment_html=''
+  payment_labels={'pending':'In attesa di pagamento','proof_submitted':'Pagamento comunicato · da verificare','partial':'Pagamento parziale','paid':'Pagato'}
+  for payment in payments:
+   residual=max(0,payment['expected_cents']-payment['received_cents']);status_label=payment_labels.get(payment['status'],'Da verificare')
+   proof=f'<a class="file" href="/pagamenti/{payment["id"]}/contabile"><span aria-hidden="true">↓</span> {esc(payment["proof_name"])} <span class="fine">Scarica contabile</span></a>' if payment.get('proof_data') else ''
+   reference=f'<dl class="payment-details"><dt>Metodo indicato</dt><dd>{esc(payment["method"] or "Non indicato")}</dd><dt>Numero transazione</dt><dd>{esc(payment["transaction_ref"] or "Non indicato")}</dd></dl>' if payment.get('transaction_ref') or payment.get('method') else ''
+   totals=f'<div class="payment-summary"><div><span>Importo previsto</span><strong>€ {money(payment["expected_cents"])}</strong></div><div><span>Ricevuto e verificato</span><strong>€ {money(payment["received_cents"])}</strong></div><div class="payment-residual"><span>Residuo</span><strong>€ {money(residual)}</strong></div></div>'
+   if admin:
+    form=f'''<form method="post" action="/lavori/{p["id"]}/conferma-pagamento" class="payment-form">{r.csrf()}<input type="hidden" name="payment" value="{payment["id"]}"><label>Importo effettivamente ricevuto<input name="received_amount" inputmode="decimal" required value="{money(payment["received_cents"])}"></label><label>Metodo<select name="payment_method"><option value="bonifico" {"selected" if payment["method"]=="bonifico" else ""}>Bonifico</option><option value="altro" {"selected" if payment["method"]=="altro" else ""}>Altro</option></select></label><label>Nota riservata del gestore<textarea name="manager_note" rows="3" maxlength="1000">{esc(payment["manager_note"])}</textarea></label><button class="button full">Aggiorna e avvisa lo studente</button></form>'''
+   else:
+    form='' if payment['status']=='paid' else f'''<form method="post" action="/lavori/{p["id"]}/pagamento" data-upload data-payment-upload>{r.csrf()}<input type="hidden" name="payment" value="{payment["id"]}"><label>Metodo<select name="payment_method"><option value="bonifico">Bonifico</option><option value="altro">Altro</option></select></label><label>Numero della transazione (se disponibile)<input name="transaction_ref" maxlength="150" value="{esc(payment["transaction_ref"])}"></label><label>Oppure carica la contabile<input type="file" accept=".pdf,.jpg,.jpeg,.png"></label><p class="fine">PDF, JPG o PNG · massimo 5 MB.</p><input type="hidden" name="file_name"><input type="hidden" name="file_data"><label>Nota facoltativa<textarea name="student_note" rows="3" maxlength="1000">{esc(payment["student_note"])}</textarea></label><button class="button full">Comunica il pagamento</button><p class="fine" data-upload-status role="status">La comunicazione non segna automaticamente il pagamento come ricevuto: il gestore lo verificherà.</p></form>'''
+   payment_html+=f'<section class="panel payment-card"><div class="payment-heading"><div><span class="eyebrow">SITUAZIONE PAGAMENTO</span><h2>{status_label}</h2></div><span class="payment-status payment-{payment["status"]}">{status_label}</span></div>{totals}{reference}{proof}{form}</section>'
+  contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
+  manager_contacts=''
+  organizer=''
+  if admin:
+   student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+   email_link=f'<a href="mailto:{esc(student_email)}">Scrivi via email ↗</a>' if student_email else '<span>Email non disponibile</span>'
+   whatsapp_link=f'<a href="https://wa.me/{esc(student.get("whatsapp"))}?text={urllib.parse.quote("Ciao, ti contatto da FormaTesi in merito al tuo lavoro.")}" target="_blank" rel="noopener">Scrivi su WhatsApp ↗</a>' if student.get('whatsapp') else '<span>WhatsApp non indicato</span>'
+   manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
+   due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
+   organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
+  receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando la prova metodologica sarà disponibile.</p></div>' if not admin and not events else ''
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
+  return self.page(r,p['title'],body),200,[]
+
+class Request:
+ def __init__(self,site,env):
+  self.site=site;self.env=env;self.path=env.get('PATH_INFO','/');self.method=env.get('REQUEST_METHOD','GET');self.q={k:v[-1] for k,v in urllib.parse.parse_qs(env.get('QUERY_STRING','')).items()};self.data={};self.user=None;self.session=None;self.cookie=None;self.ip=env.get('REMOTE_ADDR','unknown')
+  if self.method=='POST':
+   try:length=int(env.get('CONTENT_LENGTH','0') or 0)
+   except ValueError:length=0
+   if 0<=length<=8*1024*1024:
+    try:self.data={k:v[-1] for k,v in urllib.parse.parse_qs(env['wsgi.input'].read(length).decode(),max_num_fields=40).items()}
+    except (UnicodeDecodeError,ValueError):self.data={'_invalid':'1'}
+   else:self.data={'_oversized':'1'}
+ def load_session(self):
+  try:
+   cookies=http.cookies.SimpleCookie(self.env.get('HTTP_COOKIE',''));raw=cookies['ft_session'].value if 'ft_session' in cookies else ''
+   self.session=self.site.query('SELECT * FROM sessions WHERE id=? AND expires>?',(digest(raw),now()),True) if raw else None
+  except http.cookies.CookieError:self.session=None
+  if self.session and self.session['user_id']:self.user=self.site.query('SELECT * FROM users WHERE id=?',(self.session['user_id'],),True)
+ def set_cookie(self,raw,age=604800):self.cookie='ft_session='+raw+'; Path=/; HttpOnly; SameSite=Lax; Max-Age='+str(age)+('' if self.site.testing else '; Secure')
+ def clear_cookie(self):self.set_cookie('',0)
+ def login(self,user):
+  if self.session:self.site.mutate('DELETE FROM sessions WHERE id=?',(self.session['id'],))
+  raw=secrets.token_urlsafe(32);self.session={'id':digest(raw),'user_id':user['id'],'csrf':secrets.token_urlsafe(32),'expires':now()+604800}
+  self.site.mutate('INSERT INTO sessions VALUES(?,?,?,?)',tuple(self.session.values()));self.set_cookie(raw);self.user=user
+ def csrf(self):
+  if not self.session:
+   self.site.limit('forms:'+self.ip,200,3600)
+   self.site.mutate('DELETE FROM sessions WHERE expires<?',(now(),))
+   raw=secrets.token_urlsafe(32);self.session={'id':digest(raw),'user_id':None,'csrf':secrets.token_urlsafe(32),'expires':now()+3600};self.site.mutate('INSERT INTO sessions VALUES(?,?,?,?)',tuple(self.session.values()));self.set_cookie(raw,3600)
+  return '<input type="hidden" name="csrf" value="'+self.session['csrf']+'">'
+ def check_csrf(self):
+  if self.data.get('_invalid'):raise Failure('Il modulo inviato non è valido.')
+  if self.data.get('_oversized'):raise Failure('File troppo grande. Il limite è 5 MB.',413)
+  origin=self.env.get('HTTP_ORIGIN')
+  if origin and origin!=self.site.origin:raise Failure('Origine della richiesta non valida.',403)
+  if not self.session or not hmac.compare_digest(self.data.get('csrf',''),self.session['csrf']):raise Failure('La sessione del modulo è scaduta. Ricarica la pagina e riprova.',403)
+ def admin(self):
+  if not self.user or self.user['role']!='admin':raise Failure('Accesso riservato.',403)
+ def require(self,key,maximum):
+  v=self.data.get(key,'').strip()
+  if not v or len(v)>maximum:raise Failure('Controlla il campo '+{'faculty':'facoltà / corso','subject':'materia','title':'titolo','ateneo':'ateneo','body':'descrizione','name':'nome','surname':'cognome','matricola':'matricola'}.get(key,key)+'.')
+  return v
+ def password(self):
+  value=self.data.get('password','')
+  if not 12<=len(value)<=256:raise Failure('La password deve contenere da 12 a 256 caratteri.')
+  return value
+ def attachment(self):
+  name=self.data.get('file_name','');raw=self.data.get('file_data','')
+  if not name and not raw:return None
+  if not name or not raw:raise Failure('L’allegato non è stato caricato. Riprova.')
+  name=name.replace('\\','/').split('/')[-1][:180];extension=Path(name).suffix.lower()
+  if extension not in ['.pdf','.docx','.txt']:raise Failure('Sono accettati soltanto PDF, DOCX e TXT.')
+  try:data=base64.b64decode(raw,validate=True)
+  except Exception:raise Failure('Allegato non valido.')
+  if not data or len(data)>5*1024*1024:raise Failure('L’allegato deve essere inferiore a 5 MB.',413)
+  if extension=='.pdf' and not data.startswith(b'%PDF-'):raise Failure('Il file non è un PDF valido.')
+  if extension=='.docx':
+   import zipfile
+   try:
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+     if 'word/document.xml' not in z.namelist() or any('vbaproject' in x.lower() for x in z.namelist()):raise ValueError()
+     if sum(x.file_size for x in z.infolist())>40*1024*1024:raise ValueError()
+   except Exception:raise Failure('Il file Word non è valido o contiene contenuti non consentiti.')
+  if extension=='.txt':
+   try:data.decode('utf-8')
+   except UnicodeDecodeError:raise Failure('Salva il file di testo in formato UTF-8.')
+  return name,{'.pdf':'application/pdf','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','.txt':'text/plain'}[extension],data
+ def payment_attachment(self):
+  name=self.data.get('file_name','');raw=self.data.get('file_data','')
+  if not name and not raw:return None
+  if not name or not raw:raise Failure('La contabile non è stata caricata. Riprova.')
+  name=name.replace('\\','/').split('/')[-1][:180];extension=Path(name).suffix.lower()
+  if extension not in ['.pdf','.jpg','.jpeg','.png']:raise Failure('La contabile deve essere in formato PDF, JPG o PNG.')
+  try:data=base64.b64decode(raw,validate=True)
+  except Exception:raise Failure('Contabile non valida.')
+  if not data or len(data)>5*1024*1024:raise Failure('La contabile deve essere inferiore a 5 MB.',413)
+  signatures={'.pdf':b'%PDF-','.jpg':b'\xff\xd8\xff','.jpeg':b'\xff\xd8\xff','.png':b'\x89PNG\r\n\x1a\n'}
+  if not data.startswith(signatures[extension]):raise Failure('Il contenuto della contabile non corrisponde al formato indicato.')
+  return name,{'.pdf':'application/pdf','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png'}[extension],data
+
+def date(timestamp):return datetime.datetime.fromtimestamp(timestamp,datetime.timezone.utc).strftime('%d/%m/%Y · %H:%M UTC')
+def field(name,label,kind='text',autocomplete='',extra='',required=True,placeholder=''):
+ return f'<label>{esc(label)}<input name="{name}" type="{kind}" {"required" if required else ""} autocomplete="{autocomplete or "off"}" placeholder="{esc(placeholder)}" {extra}></label>'
+def badge(p):return '<span class="badge '+p['status']+'">'+STATUS[p['status']]+(' · Revisione n. '+str(p['revision']) if p['status']=='revised' else '')+'</span>'
+def file_link(f):return f'<a class="file" href="/file/{f["id"]}"><span aria-hidden="true">↓</span> {esc(f["name"])} <span class="fine">Scarica</span></a>'
+def project_card(p,admin=False):
+ owner=''
+ planning=''
+ if admin:
+  email=p.get('contact_email') or (p.get('email') if not str(p.get('email') or '').endswith('@pratica.invalid') else '')
+  identity=p.get('username') or p.get('matricola') or 'Studente senza identificativo'
+  contacts=' · '.join(x for x in [email,p.get('whatsapp')] if x)
+  owner=f'<div class="project-owner"><strong>Studente: {esc(identity)}</strong><span>Codice: {esc(p.get("matricola"))}</span>{f"<span>{esc(contacts)}</span>" if contacts else ""}</div>'
+  priority={'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')
+  deadline=' · Scadenza '+datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%d/%m/%Y') if p.get('due_at') else ' · Nessuna scadenza'
+  planning=f'<div class="planning-line priority-{esc(p.get("priority") or "normal")}"><strong>Priorità {priority}</strong><span>{deadline}</span></div>'
+ return f'<a class="project-card" href="/lavori/{p["id"]}"><div class="project-symbol" aria-hidden="true">F/</div><div class="project-info"><span class="eyebrow">{esc(p["ateneo"])}</span><h2>{esc(p["title"])}</h2>{owner}{planning}<p>{esc(p["subject"])}</p></div><div class="project-meta">{badge(p)}<span class="fine">Aggiornato {date(p["updated"])}</span></div><span class="card-arrow" aria-hidden="true">↗</span></a>'
+
+def landing():
+ return '''<section class="hero"><div class="hero-copy"><div class="free-pill"><span>REGALO DI BENVENUTO</span> 1 paragrafo gratuito</div><h1>La tua tesi.<br>Finalmente,<br><em>prende forma.</em></h1><p>Non devi affidarti a parole o promesse. Inviaci i dati essenziali della tua tesi: prepariamo gratuitamente un primo paragrafo dimostrativo sul tuo progetto. Lo valuti e soltanto dopo decidi se continuare.</p><div class="hero-actions"><a class="button conversion" href="/registrati">Ottieni il paragrafo gratuito <span>↗</span></a><a class="underlined" href="/anteprima">Guarda l’area personale</a></div><div class="trust-line"><span>✓ Nessun pagamento</span><span>✓ Nessun abbonamento</span><span>✓ Decidi dopo la prova</span></div></div><div class="hero-visual"><div class="orbit-label">IL TUO PROGETTO.<br>UNA PROVA CONCRETA.</div><div class="paper-stack"><div class="document hero-doc"><div class="doc-university">IL TUO PROSSIMO TRAGUARDO</div><div class="doc-rule"></div><span class="doc-kicker">PARAGRAFO DIMOSTRATIVO</span><h2>Un primo testo<br>costruito sulla<br>tua tesi.</h2><div class="paper-lines"><i></i><i></i><i></i></div><div class="doc-bottom">FormaTesi <span>PROVA GRATUITA</span></div></div></div><div class="floating-note"><span class="note-icon">✓</span><div><strong>Gratis, davvero.</strong><span>Prima valuti. Poi scegli.</span></div></div><span class="visual-caption">Una prova per studente, previa verifica.</span></div></section><section class="consulting-strip"><div><strong>Hai un dubbio prima di iniziare?</strong><span>La consulenza iniziale è gratuita.</span></div><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Scrivi ora su WhatsApp ↗</a></section><section class="university-section"><div class="section-heading compact-heading"><span class="eyebrow">CONOSCIAMO IL TUO PERCORSO</span><h2>Partiamo dal tuo ateneo.</h2><p>Seleziona l’università nella richiesta: il progetto sarà organizzato in base alle informazioni che ci fornisci.</p></div><div class="university-logos"><div class="uni-logo"><img src="https://www.centrostudibn.it/wp-content/uploads/2022/09/ecampus.png" alt="Università eCampus" loading="lazy"></div><div class="uni-logo"><img src="https://www.uniares.com/wp-content/uploads/2024/04/Pegaso-con-sfondo-white.jpg" alt="Università Telematica Pegaso" loading="lazy"></div><div class="uni-logo"><img src="https://www.studentitelematici.cloud/wp-content/uploads/2022/04/fb1e9709-c8c5-404a-9596-04c17b1ee230.png" alt="Universitas Mercatorum" loading="lazy"></div><div class="uni-logo"><img src="https://mediakey.it/wp-content/uploads/2025/06/uni-san-raffaele-logo.jpg" alt="Università San Raffaele Roma" loading="lazy"></div></div><p class="trademark-note">I marchi appartengono ai rispettivi titolari. FormaTesi è un servizio indipendente e non è affiliato agli atenei.</p></section><section id="come-funziona" class="section"><div class="section-heading"><span class="eyebrow">COME FUNZIONA</span><h2>Prima vedi come lavoriamo.<br>Poi scegli.</h2><p>Ci bastano le informazioni essenziali per preparare la tua prova personalizzata.</p></div><div class="steps"><article><span class="step-number">01</span><h3>Raccontaci la tua tesi.</h3><p>Indica ateneo, facoltà, materia e titolo. Aggiungi l’indice oppure il paragrafo da cui partire.</p></article><article class="featured-step"><span class="step-number">02</span><span class="gift-tag">TE LO REGALIAMO</span><h3>Ricevi un paragrafo gratuito.</h3><p>Il lavoro arriva nella tua area personale. È una prova concreta sul tuo progetto, non un esempio generico.</p></article><article><span class="step-number">03</span><h3>Decidi senza pressioni.</h3><p>Se il metodo ti convince, chiedi una proposta personalizzata. Prima di accettare sai che cosa comprende.</p></article></div><div class="center-cta"><a class="button conversion" href="/registrati">Richiedi la tua prova gratuita ↗</a><span>Richiede pochi minuti · una prova per studente</span></div></section><section class="feature-section"><div><span class="eyebrow">IL TUO SPAZIO, SEMPRE IN ORDINE</span><h2>Meno messaggi da cercare.<br>Più chiarezza sul lavoro.</h2><p>Ogni consegna resta nel tuo account. Le richieste di modifica sono collegate al lavoro e ogni revisione ha il proprio numero.</p><a class="button light" href="/anteprima">Esplora un’area di esempio ↗</a></div><div class="workflow-preview"><div class="preview-top"><span>Il percorso del tuo lavoro</span><span>↗</span></div><div class="workflow-row"><span class="workflow-index">01</span><div><strong>In attesa</strong><p>La richiesta è stata inviata.</p></div></div><div class="workflow-row"><span class="workflow-index">02</span><div><strong>Consegnato</strong><p>Il primo lavoro è disponibile.</p></div></div><div class="workflow-row"><span class="workflow-index">03</span><div><strong>Da revisionare</strong><p>Le tue osservazioni sono raccolte qui.</p></div></div><div class="workflow-row highlight"><span class="workflow-index">✓</span><div><strong>Revisionato <span class="mini-badge">n. 1</span></strong><p>Una nuova versione, senza perdere la precedente.</p></div></div></div></section><section class="section support"><div class="section-heading"><span class="eyebrow">DA DOVE PARTIAMO?</span><h2>Il supporto giusto<br>per il tuo momento.</h2></div><div class="support-grid"><article><span>↗</span><h3>Hai un’idea da sviluppare.</h3><p>Mettiamo a fuoco la struttura del lavoro e il percorso di ricerca.</p></article><article><span>¶</span><h3>Hai un testo da migliorare.</h3><p>Revisione del contenuto, attenzione alle fonti e alle indicazioni ricevute.</p></article><article><span>≡</span><h3>Vuoi dare ordine al documento.</h3><p>Un aiuto con l’impaginazione e la coerenza delle citazioni.</p></article></div></section><section id="domande" class="section faq"><div><span class="eyebrow">PRIMA DI COMINCIARE</span><h2>Facciamo chiarezza.</h2><p>Vuoi parlarne prima?<br><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Consulenza gratuita su WhatsApp ↗</a></p></div><div><details><summary>Che cosa ricevo gratuitamente?</summary><p>Un primo paragrafo dimostrativo preparato a partire dai dati del tuo progetto. La richiesta viene valutata e la prova è disponibile una sola volta per studente.</p></details><details><summary>La prova mi obbliga ad acquistare?</summary><p>No. Non inserisci dati di pagamento e non attivi abbonamenti. Valuti il lavoro e decidi tu se richiedere una proposta.</p></details><details><summary>Che cosa serve per iniziare?</summary><p>Ateneo, facoltà o corso di laurea, materia e titolo della tesi. Aggiungi l’indice, anche come file, oppure il titolo del paragrafo.</p></details><details><summary>Posso chiedere modifiche?</summary><p>Dopo una consegna puoi inviare una richiesta di revisione dalla tua area. Le revisioni incluse negli eventuali lavori successivi vengono indicate nella proposta.</p></details><details><summary>Siete collegati alla mia università?</summary><p>No. FormaTesi è un servizio indipendente di supporto accademico. Lo studente rimane responsabile del proprio elaborato e delle regole dell’ateneo.</p></details></div></section><section class="final-cta"><span class="eyebrow">NON DEVI ANCORA SCEGLIERCI. DEVI SOLO PROVARCI.</span><h2>Il primo paragrafo<br>lo offriamo noi.</h2><p>Nessun pagamento. Nessun abbonamento. Una prova concreta sul tuo progetto.</p><a class="button conversion" href="/registrati">Ottieni il paragrafo gratuito ↗</a><div class="direct-contacts"><a href="https://m.me/61593221212687">Preferisci Messenger?</a><a href="https://wa.me/393505815735?text=Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.">Scrivici su WhatsApp</a></div></section>'''
+
+def public_landing(reviews,portal_ready=False):
+ cards=''.join(f'<article class="review-card"><div class="review-stars" aria-label="{x["rating"]} stelle su 5">{"★"*x["rating"]}<span>{"★"*(5-x["rating"])}</span></div><blockquote>“{esc(x["body"])}”</blockquote><div class="review-by"><strong>{esc(x["author"])}</strong><time datetime="{esc(x["review_date"])}">{esc(x["review_date"])}</time></div><a href="{esc(x["review_url"])}" target="_blank" rel="noopener">Recensione originale su Facebook ↗</a></article>' for x in reviews)
+ if not cards:cards=f'<div class="reviews-empty"><span class="fb-review-mark">{SOCIAL_ICONS["facebook"]}</span><div><h3>Le parole di chi ci ha scelto.</h3><p>Leggi le recensioni direttamente sulla pagina Facebook di FormaTesi.</p></div><a class="button secondary" href="{FB_REVIEWS}" target="_blank" rel="noopener">Leggi su Facebook ↗</a></div>'
+ section=f'<section id="recensioni" class="reviews-section"><div class="reviews-heading"><div><span class="eyebrow">RECENSIONI VERIFICATE SU FACEBOOK</span><h2>Esperienze reali.<br>Fonti trasparenti.</h2></div><p>Pubblichiamo soltanto testimonianze controllate sulla pagina Facebook FormaTesi. Ogni recensione rimanda alla fonte originale.</p></div><div class="reviews-grid">{cards}</div><div class="reviews-footer"><span>Hai già lavorato con noi?</span><a href="{FB_REVIEWS}" target="_blank" rel="noopener">Lascia la tua recensione su Facebook ↗</a></div></section>'
+ base=landing().replace('Ottieni il paragrafo gratuito <span>↗</span>','Ottieni il tuo paragrafo gratuito subito <span>↗</span>',1)
+ base=base.replace('Non devi affidarti a parole o promesse. Inviaci i dati essenziali della tua tesi: prepariamo gratuitamente un primo paragrafo dimostrativo sul tuo progetto. Lo valuti e soltanto dopo decidi se continuare.','Prima di affidarti a noi, mettici alla prova. Inserisci i dati della tua tesi e ricevi gratuitamente un paragrafo preparato sul tuo progetto, non un esempio generico. Lo leggi, valuti come lavoriamo e solo dopo decidi se continuare.')
+ base=base.replace('</div><div class="trust-line">','</div><p class="registration-note">Registrazione gratuita obbligatoria · inserisci i dati essenziali della tua tesi</p><div class="trust-line">',1)
+ base=base.replace('<p class="registration-note">','<div class="proof-chip"><span aria-hidden="true">✓</span><strong>Prima leggi il lavoro. Poi scegli.</strong></div><p class="registration-note">',1)
+ base=base.replace('Seleziona l’università nella richiesta: il progetto sarà organizzato in base alle informazioni che ci fornisci.','Seguiamo studenti delle università telematiche e dei principali atenei italiani. Se il tuo non è nell’elenco, puoi comunque inserirlo liberamente.')
+ old_logos='<div class="university-logos"><div class="uni-logo"><img src="https://www.centrostudibn.it/wp-content/uploads/2022/09/ecampus.png" alt="Università eCampus" loading="lazy"></div><div class="uni-logo"><img src="https://www.uniares.com/wp-content/uploads/2024/04/Pegaso-con-sfondo-white.jpg" alt="Università Telematica Pegaso" loading="lazy"></div><div class="uni-logo"><img src="https://www.studentitelematici.cloud/wp-content/uploads/2022/04/fb1e9709-c8c5-404a-9596-04c17b1ee230.png" alt="Universitas Mercatorum" loading="lazy"></div><div class="uni-logo"><img src="https://mediakey.it/wp-content/uploads/2025/06/uni-san-raffaele-logo.jpg" alt="Università San Raffaele Roma" loading="lazy"></div></div>'
+ new_logos='''<div class="university-logos"><div class="uni-logo featured"><img src="https://www.centrostudibn.it/wp-content/uploads/2022/09/ecampus.png" alt="Università eCampus" loading="lazy" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>eCampus</span></div><div class="uni-logo featured"><img src="https://www.uniares.com/wp-content/uploads/2024/04/Pegaso-con-sfondo-white.jpg" alt="Università Telematica Pegaso" loading="lazy" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>Pegaso</span></div><div class="uni-logo featured"><img src="https://www.studentitelematici.cloud/wp-content/uploads/2022/04/fb1e9709-c8c5-404a-9596-04c17b1ee230.png" alt="Universitas Mercatorum" loading="lazy" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>Mercatorum</span></div><div class="uni-logo featured"><img src="https://mediakey.it/wp-content/uploads/2025/06/uni-san-raffaele-logo.jpg" alt="Università San Raffaele Roma" loading="lazy" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>San Raffaele Roma</span></div><div class="uni-logo name-only"><span>Unitelma<br><strong>Sapienza</strong></span></div><div class="uni-logo name-only"><span>Università<br><strong>G. Marconi</strong></span></div><div class="uni-logo name-only"><span>Università<br><strong>Niccolò Cusano</strong></span></div><div class="uni-logo name-only"><span><strong>UNINETTUNO</strong></span></div><div class="uni-logo name-only"><span><strong>IUL</strong><br>Università Telematica</span></div><div class="uni-logo name-only"><span>Università<br><strong>Giustino Fortunato</strong></span></div><div class="uni-logo name-only"><span>Roma<br><strong>La Sapienza</strong></span></div><div class="uni-logo name-only"><span>Napoli<br><strong>Federico II</strong></span></div></div><p class="other-universities">E anche Bologna, Palermo, Catania, Milano, Torino e qualsiasi altro ateneo italiano.</p>'''
+ base=base.replace(old_logos,new_logos)
+ graduation='''<section class="graduation-story"><div class="graduation-main"><img src="/static/laureati-formatesi.webp" alt="Un gruppo di ragazzi e ragazze felici dopo la laurea" loading="lazy" width="1600" height="1067"><div class="graduation-copy"><span class="eyebrow">IL TRAGUARDO CHE STAI COSTRUENDO</span><h2>Immagina quel momento.<br>Comincia da un primo passo.</h2><p>La tesi non deve essere un peso affrontato da soli. Con FormaTesi inizi da una prova reale e gratuita, costruita sul tuo argomento.</p><a class="button conversion" href="/registrati">Voglio il mio paragrafo gratuito ↗</a></div></div><div class="graduation-small"><img src="/static/tesi-laurea-formatesi.webp" alt="Due giovani laureati sfogliano insieme una tesi" loading="lazy" width="1200" height="900"><p><strong>Non un testo generico.</strong><br>Un primo lavoro legato alla tua tesi, da valutare prima di decidere.</p></div></section>'''
+ base=base.replace('<section id="come-funziona"',graduation+'<section id="come-funziona"',1)
+ base=base.replace('Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20gratuita%20per%20la%20mia%20tesi.','Ciao%20FormaTesi%2C%20vorrei%20una%20consulenza%20per%20la%20mia%20tesi.')
+ if not portal_ready:
+  base=base.replace('href="/registrati"',f'href="{WHATSAPP}" target="_blank" rel="noopener"')
+  base=base.replace('href="/anteprima"','href="#come-funziona"')
+  base=base.replace('Guarda l’area personale','Scopri come funziona')
+  base=base.replace('Registrazione gratuita obbligatoria · inserisci i dati essenziali della tua tesi','Scrivici senza impegno · ti diremo subito quali informazioni servono')
+  base=base.replace('Il lavoro arriva nella tua area personale. È una prova concreta sul tuo progetto, non un esempio generico.','Ricevi la prova tramite il contatto concordato. È costruita sul tuo progetto, non è un esempio generico.')
+  base=base.replace('Richiede pochi minuti · una prova per studente','Prima consulenza gratuita · nessun pagamento anticipato')
+  base=base.replace('IL TUO SPAZIO, SEMPRE IN ORDINE','UN PERCORSO CHIARO, DALL’INIZIO')
+  base=base.replace('Meno messaggi da cercare.<br>Più chiarezza sul lavoro.','Sai sempre qual è<br>il prossimo passaggio.')
+  base=base.replace('Ogni consegna resta nel tuo account. Le richieste di modifica sono collegate al lavoro e ogni revisione ha il proprio numero.','Concordiamo insieme obiettivo, materiali e tempi. Ricevi aggiornamenti chiari, consegne ordinate e revisioni numerate.')
+  base=base.replace('Esplora un’area di esempio ↗','Chiedi una consulenza gratuita ↗')
+  base=base.replace('<p>La richiesta è stata inviata.</p>','<p>Ci racconti ateneo, corso e argomento.</p>')
+  base=base.replace('<p>Il primo lavoro è disponibile.</p>','<p>Ricevi il primo lavoro concordato.</p>')
+  base=base.replace('<p>Le tue osservazioni sono raccolte qui.</p>','<p>Raccogliamo le tue osservazioni.</p>')
+  base=base.replace('<p>Una nuova versione, senza perdere la precedente.</p>','<p>Ricevi la versione aggiornata e numerata.</p>')
+  base=base.replace('Dopo una consegna puoi inviare una richiesta di revisione dalla tua area. Le revisioni incluse negli eventuali lavori successivi vengono indicate nella proposta.','Sì. Le revisioni comprese vengono chiarite nella proposta e ogni nuova versione è identificata con un numero.')
+ links='<nav class="university-links" aria-label="Approfondimenti per ateneo">'+''.join(f'<a href="/atenei/{slug}">{esc(name)}</a>' for slug,name in ATENEI_PAGES.items())+'</nav>'
+ base=base.replace('<p class="other-universities">E anche Bologna, Palermo, Catania, Milano, Torino e qualsiasi altro ateneo italiano.</p>','<p class="other-universities">E anche Bologna, Palermo, Catania, Milano, Torino e qualsiasi altro ateneo italiano.</p>'+links)
+ return base.replace('<section id="domande"',section+'<section id="domande"',1)
+
+def university_page(slug,portal_ready=False):
+ name=ATENEI_PAGES[slug]
+ cta='/registrati' if portal_ready else WHATSAPP
+ external='' if portal_ready else ' target="_blank" rel="noopener"'
+ return f'''<section class="university-hero"><div><a class="back" href="/">← Tutti gli atenei</a><span class="eyebrow">SUPPORTO TESI · {esc(name)}</span><h1>Un primo passo concreto per la tua tesi.</h1><p>Partiamo dalle informazioni del tuo corso, dalla materia, dal titolo e dall’indice oppure dal paragrafo che vuoi sviluppare. Ricevi una prova personalizzata e valuti il metodo prima di decidere se proseguire.</p><a class="button conversion" href="{cta}"{external}>Ottieni il paragrafo gratuito ↗</a></div><aside class="panel"><h2>Che cosa ci serve</h2><ol><li>Ateneo e corso di laurea</li><li>Materia e titolo della tesi</li><li>Indice oppure titolo del paragrafo</li><li>Indicazioni ricevute dal relatore, se disponibili</li></ol><p class="notice">FormaTesi è un servizio indipendente e non è affiliato a {esc(name)}. Lo studente rimane responsabile dell’elaborato presentato e del rispetto delle regole dell’ateneo.</p></aside></section><section class="section"><div class="section-heading"><span class="eyebrow">COME TI ACCOMPAGNIAMO</span><h2>Ricerca, revisione e organizzazione.</h2><p>Il lavoro viene seguito nella tua area personale: richiesta iniziale, documenti, consegne, osservazioni e revisioni numerate rimangono nello stesso spazio.</p></div><div class="steps"><article><span class="step-number">01</span><h3>Raccogliamo il materiale.</h3><p>Controlliamo che le informazioni essenziali siano sufficienti per cominciare.</p></article><article><span class="step-number">02</span><h3>Prepariamo la prova.</h3><p>Il primo esempio è costruito sul tuo argomento, non su un facsimile generico.</p></article><article><span class="step-number">03</span><h3>Decidi con chiarezza.</h3><p>Se vuoi continuare, ricevi una proposta che specifica attività, tempi e revisioni.</p></article></div></section>'''
+
+def demo():
+ return '''<section class="workspace"><div class="notice">Anteprima dimostrativa · Il progetto qui sotto è un esempio, non appartiene a uno studente reale.</div><div class="page-heading"><div><span class="eyebrow">IL TUO SPAZIO FORMATESI</span><h1>Tutto il lavoro.<br>Un unico posto.</h1><p>Ecco come ritroverai le consegne e le revisioni del tuo progetto.</p></div><a class="button" href="/registrati">Crea il tuo account ↗</a></div><div class="detail-layout"><div><section class="panel"><span class="eyebrow">ESEMPIO · SCIENZE DELL’EDUCAZIONE</span><h2>Il gioco come esperienza di apprendimento.</h2><span class="badge revised">Revisionato · Revisione n. 1</span><div class="timeline"><article class="timeline-item"><span class="eyebrow">PRIMA CONSEGNA</span><h3>1.1 Il valore educativo del gioco</h3><p>Il lavoro iniziale viene pubblicato qui. Quando il servizio è attivo, puoi aprire il testo e scaricare il documento dalla stessa scheda.</p><div class="file">Documento della prima consegna <span class="fine">Esempio</span></div></article><article class="timeline-item"><span class="eyebrow">RICHIESTA DI REVISIONE</span><h3>Le osservazioni dello studente</h3><p>“Vorrei approfondire il collegamento con le attività nella scuola dell’infanzia.”</p></article><article class="timeline-item"><span class="eyebrow">REVISIONE N. 1</span><h3>La versione aggiornata</h3><p>La revisione compare dopo la consegna, con le modifiche richieste. La versione iniziale rimane consultabile.</p></article></div></section></div><aside><section class="panel"><h3>La scheda del progetto</h3><dl><dt>Ateneo</dt><dd>eCampus · esempio</dd><dt>Facoltà / corso</dt><dd>Scienze dell’educazione · L-19</dd><dt>Materia</dt><dd>Pedagogia generale</dd><dt>Paragrafo</dt><dd>1.1 Il valore educativo del gioco</dd></dl></section><section class="aside-note"><h3>Un passaggio alla volta.</h3><p>Il numero di revisione aumenta quando ricevi una nuova versione corretta, non quando invii una richiesta.</p></section></aside></div></section>'''
+
+def legal(site,path):
+ if not site.ready:return '<section class="narrow panel"><span class="eyebrow">ANTEPRIMA FORMATESI</span><h1>'+('Privacy' if path=='/privacy' else 'Condizioni del servizio')+'</h1><p>L’area di registrazione non è ancora attiva e questa anteprima non raccoglie richieste o documenti degli studenti. Il sito non utilizza strumenti pubblicitari o di analisi del traffico. Il fornitore di hosting può trattare i dati tecnici necessari all’erogazione del sito.</p><p>Le informazioni complete sul titolare e sulle condizioni saranno pubblicate prima dell’apertura delle registrazioni.</p><a href="'+FB+'">Contatta FormaTesi</a></section>'
+ if site.code_mode:
+  contact=esc(site.cfg.get('PRIVACY_CONTACT') or site.cfg.get('ADMIN_EMAIL') or 'aiutotesidilaurea@proton.me')
+  if path=='/privacy':text=f'''<h1>Informativa dell’account personale</h1><p>Contatto per le richieste relative ai dati: {contact}.</p><h2>Dati ridotti al minimo</h2><p>L’account non richiede nome, cognome o matricola. Conserva il codice di accesso, la password in forma protetta, l’email necessaria alle notifiche, i dati accademici inseriti e gli eventuali materiali caricati. L’email viene usata per confermare le richieste e avvisare quando lavori o revisioni sono disponibili. Il numero WhatsApp è facoltativo e viene usato per comunicazioni sui lavori soltanto con il consenso dello studente, revocabile dall’account personale.</p><h2>Sicurezza e fornitori</h2><p>I servizi tecnici di hosting, database e invio email possono trattare i dati necessari al funzionamento e alla sicurezza. Non utilizziamo pubblicità, profilazione o analisi commerciali del traffico.</p><h2>Scelte dello studente</h2><p>Non inserire nomi, matricole, recapiti o altri dati personali nei titoli e nei documenti. Puoi chiedere accesso o cancellazione indicando il codice di accesso al contatto riportato sopra.</p><h2>Cookie</h2><p>Viene utilizzato soltanto il cookie tecnico necessario a mantenere l’accesso sicuro all’account.</p>'''
+  else:text='''<h1>Condizioni dell’account personale</h1><p>FormaTesi offre tutoraggio, supporto alla ricerca, revisione linguistica e metodologica, organizzazione delle fonti ed esempi redazionali. Lo studente rimane autore e responsabile dell’elaborato finale e del rispetto delle regole del proprio ateneo.</p><h2>Prova metodologica gratuita</h2><p>La prova è un esempio personalizzato sul tema indicato, destinato alla valutazione del metodo e non un elaborato da presentare come proprio. La disponibilità dipende dai materiali ricevuti. Il codice di accesso deve essere conservato per consultare il progetto, i materiali e le revisioni.</p><h2>Percorso successivo</h2><p>L’eventuale proposta riguarda un percorso di affiancamento e revisione. FormaTesi non sostituisce lo studente nella paternità dell’elaborato.</p><h2>Notifiche</h2><p>È necessario fornire un indirizzo email valido per ricevere la conferma delle richieste e gli avvisi sui nuovi materiali o sulle revisioni.</p><h2>Materiali</h2><p>È vietato caricare frontespizi o file contenenti nome, matricola, firme, documenti di identità o dati personali non necessari. Non sono garantiti voti, approvazioni o risultati di software di rilevazione.</p>'''
+  if path=='/privacy':text=text.replace('i dati accademici inseriti e gli eventuali materiali caricati','i dati accademici inseriti, gli eventuali materiali caricati e, per i servizi concordati, stato del pagamento, riferimento della transazione e contabile').replace('quando lavori o revisioni sono disponibili','quando lavori, revisioni o pagamenti sono aggiornati')
+  return '<section class="narrow panel legal">'+text+'</section>'
+ business=esc(site.cfg.get('BUSINESS_NAME'));contact=esc(site.cfg.get('PRIVACY_CONTACT'))
+ if path=='/privacy':text=f'''<h1>Informativa privacy</h1><p>Titolare del trattamento: {business}. Contatto: {contact}.</p><h2>Dati e finalità</h2><p>Trattiamo nome, cognome, email e matricola per gestire l’account. I dati del percorso universitario, i testi e gli allegati servono a valutare le richieste e fornire il supporto richiesto. La base giuridica è l’esecuzione del servizio e delle misure precontrattuali richieste.</p><p>I controlli su richieste ripetute e i registri di sicurezza tutelano il servizio da abusi, sulla base del legittimo interesse. Le segnalazioni di somiglianza sono valutate da una persona e non determinano automaticamente l’esclusione.</p><h2>Accesso e fornitori</h2><p>I materiali sono accessibili allo studente e al gestore autorizzato. Sono coinvolti i fornitori di hosting, database e invio email necessari al servizio. Fornitori e garanzie applicabili: {esc(site.cfg.get('PRIVACY_PROVIDERS'))}.</p><h2>Conservazione e diritti</h2><p>Criteri di conservazione: {esc(site.cfg.get('RETENTION_POLICY'))}. Puoi chiedere accesso, rettifica, cancellazione o limitazione, e opporti ai trattamenti fondati sul legittimo interesse, scrivendo al contatto indicato. Puoi proporre reclamo al Garante per la protezione dei dati personali.</p><h2>Cookie</h2><p>Utilizziamo soltanto il cookie tecnico di sessione necessario all’accesso e alla sicurezza dei moduli. Non usiamo cookie pubblicitari né strumenti di profilazione.</p>'''
+ else:text=f'''<h1>Condizioni del servizio</h1><p>Il servizio FormaTesi è gestito da {business}. Contatto: {contact}.</p><h2>Supporto accademico</h2><p>Il servizio offre tutoraggio, supporto metodologico, ricerca delle fonti, revisione linguistica, organizzazione dell’elaborato ed esempi redazionali. Lo studente rimane autore e responsabile del testo finale, delle fonti utilizzate e del rispetto delle regole del proprio ateneo.</p><h2>Prova metodologica gratuita</h2><p>È disponibile una sola prova per studente, previa verifica dei materiali e della disponibilità. È un esempio personalizzato destinato a mostrare il metodo di lavoro, non un elaborato da presentare come proprio. Creare più account non dà diritto a ulteriori prove.</p><h2>Proposte e revisioni</h2><p>Le proposte indicano le attività di affiancamento, l’importo, i tempi e le revisioni incluse. Il pulsante “Conferma interesse” non effettua pagamenti. Gli eventuali servizi a pagamento sono definiti separatamente prima del pagamento. Non sono garantiti voti, approvazioni o risultati di software di rilevazione.</p><h2>Materiali caricati</h2><p>Carica soltanto documenti che hai diritto di condividere ed evita informazioni personali non necessarie. I materiali e le revisioni vengono archiviati nella scheda del progetto.</p>'''
+ return '<section class="narrow panel legal">'+text+'</section>'
+
+app=Site()
+if __name__=='__main__':
+ from wsgiref.simple_server import make_server
+ make_server('127.0.0.1',8000,app).serve_forever()
