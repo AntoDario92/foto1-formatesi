@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    add_column('projects','priority',"TEXT NOT NULL DEFAULT 'normal'")
    add_column('projects','due_at','BIGINT')
    add_column('projects','manager_note','TEXT')
+   add_column('projects','chapter',"TEXT NOT NULL DEFAULT ''")
    add_column('outbox','attempts','INTEGER NOT NULL DEFAULT 0')
    add_column('outbox','last_error','TEXT')
    add_column('outbox','sent_at','BIGINT')
@@ -185,8 +186,12 @@ class Site:
  def notify_admin(self,project,subject,message):
   user=self.query('SELECT * FROM users WHERE id=?',(project['user_id'],),True)
   identity=(['Codice di accesso: '+user['matricola']] if user['email'].endswith('@pratica.invalid') else ['Studente: '+user['name']+' '+user['surname'],'Email: '+user['email'],'Matricola: '+user['matricola']])
-  details='\n'.join(identity+['Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Paragrafo richiesto: '+(project['paragraph'] or 'non indicato')])
+  details='\n'.join(identity+['Ateneo: '+project['ateneo'],'Facoltà / corso: '+project['faculty'],'Materia: '+project['subject'],'Titolo della tesi: '+project['title'],'Titolo del capitolo: '+(project.get('chapter') or 'non indicato'),'Titolo del paragrafo: '+(project['paragraph'] or 'non indicato')])
   self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),subject,message.strip()+'\n\n'+details+'\n\nApri la richiesta:\n'+self.origin+'/lavori/'+project['id'])
+ def notify_admin_account(self,user):
+  email=user.get('contact_email') or (user['email'] if not user['email'].endswith('@pratica.invalid') else 'non disponibile')
+  details=['È stato creato un nuovo account studente FormaTesi.','','Codice di accesso / matricola: '+user['matricola'],'Username: '+(user.get('username') or 'non scelto'),'Nome: '+((' '.join([user.get('name',''),user.get('surname','')])).strip() if user.get('name')!='Studente' else 'non raccolto'),'Email di contatto: '+email,'WhatsApp: '+(user.get('whatsapp') or 'non indicato'),'','Apri il pannello gestore:',self.origin+'/area']
+  self.mail(self.cfg.get('ADMIN_EMAIL','admin@example.test'),'Nuovo account studente FormaTesi','\n'.join(details))
  def __call__(self,environ,start_response):
   self_req=Request(self,environ)
   try:body,code,headers=self.route(self_req)
@@ -206,7 +211,7 @@ class Site:
  def page(self,r,title,body):
   if r.method=='POST':
    for key,value in r.data.items():
-    if key not in ['name','surname','matricola','email','contact_email','username','whatsapp','faculty','subject','title','paragraph','outline','other_ateneo','body','description','amount','author','review_url','review_date','rating']:continue
+    if key not in ['name','surname','matricola','email','contact_email','username','whatsapp','faculty','subject','title','chapter','paragraph','outline','other_ateneo','body','message_subject','message_body','description','amount','author','review_url','review_date','rating']:continue
     body=re.sub(r'(<input\b[^>]*name="'+re.escape(key)+r'"[^>]*)(>)',lambda m:m[1]+' value="'+esc(value)+'"'+m[2],body)
     body=re.sub(r'(<textarea\b[^>]*name="'+re.escape(key)+r'"[^>]*>)(.*?)(</textarea>)',lambda m:m[1]+esc(value)+m[3],body,flags=re.S)
    selected=r.data.get('ateneo','')
@@ -374,9 +379,11 @@ class Site:
      profile=self.facebook_ticket(r.data.get('ticket',''));email=profile['email'];matricola=r.require('matricola',150)
      if r.data.get('terms')!='yes':raise Failure('Leggi e accetta le condizioni per continuare.')
      existing=self.query('SELECT * FROM users WHERE facebook_id=? OR email=?',(profile['id'],email),True)
+     created=False
      if existing:self.mutate('UPDATE users SET facebook_id=?,verified=1 WHERE id=?',(profile['id'],existing['id']));user=self.query('SELECT * FROM users WHERE id=?',(existing['id'],),True)
      else:
-      ident=uid();self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,facebook_id) VALUES(?,?,?,?,?,?,1,?,?,?)',(ident,profile['name'],profile['surname'],email,password_hash(secrets.token_urlsafe(32)),matricola,'student',now(),profile['id']));user=self.query('SELECT * FROM users WHERE id=?',(ident,),True)
+      ident=uid();self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,facebook_id) VALUES(?,?,?,?,?,?,1,?,?,?)',(ident,profile['name'],profile['surname'],email,password_hash(secrets.token_urlsafe(32)),matricola,'student',now(),profile['id']));user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);created=True
+     if created and email.lower()!=self.cfg.get('ADMIN_EMAIL','').lower():self.notify_admin_account(user)
      r.login(user);self.audit(user['id'],'facebook.registration');return self.redirect('/area')
     if p!='/reimposta' and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Failure('Inserisci un indirizzo email valido.')
     if p=='/registrati':
@@ -388,6 +395,7 @@ class Site:
       ident=uid();self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created) VALUES(?,?,?,?,?,?,0,?,?)',(ident,*values[:2],email,password_hash(password),values[2],'student',now()))
       existing=self.query('SELECT * FROM users WHERE id=?',(ident,),True)
       raw=self.token(existing,'verify');self.mail(email,'Verifica il tuo account FormaTesi','Per verificare la tua email apri questo link entro un’ora: '+self.origin+'/verifica?token='+raw)
+      if email!=self.cfg.get('ADMIN_EMAIL','').lower():self.notify_admin_account(existing)
      message='Se l’indirizzo può essere registrato, riceverai un’email per attivare l’account. Se hai già un account, accedi o recupera la password.'
     elif p=='/login':
      self.limit('login:'+email,10)
@@ -462,6 +470,7 @@ class Site:
      self.mutate('INSERT INTO users(id,name,surname,email,password,matricola,verified,role,created,contact_email,username,whatsapp,whatsapp_opt_in) VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?)',(ident,'Studente','FormaTesi',internal,password_hash(password),code,'student',now(),contact,username or None,whatsapp or None,opt_in))
      user=self.query('SELECT * FROM users WHERE id=?',(ident,),True);r.login(user);self.audit(user['id'],'code.registration')
      self.mail(contact,'Il tuo accesso personale FormaTesi','Conserva questo codice di accesso: '+code+'\n\nPer accedere ai tuoi progetti: '+self.origin+'/login')
+     self.notify_admin_account(user)
      username_note=f'<p><strong>Username:</strong> {esc(username)}</p>' if username else ''
      body=f'''<section class="narrow panel code-success"><span class="eyebrow">IL TUO ACCOUNT PERSONALE</span><h1>Conserva le credenziali.</h1><p>Puoi entrare nei tuoi progetti con il codice di accesso oppure con lo username scelto.</p><div class="practice-code" aria-label="Codice di accesso">{esc(code)}</div>{username_note}<p class="notice">Ti abbiamo inviato anche una copia del codice via email. La stessa email riceverà gli avvisi sui materiali e sulle revisioni.</p><a class="button full" href="/nuovo">Richiedi la prova gratuita ↗</a></section>'''
      return self.page(r,'Il tuo account personale',body),200,[]
@@ -525,14 +534,13 @@ class Site:
     ateneo=r.require('ateneo',150)
     if ateneo=='Altro ateneo':ateneo=r.require('other_ateneo',150)
     faculty=r.require('faculty',250);subject=r.require('subject',250);title=r.require('title',500)
-    outline=r.data.get('outline','').strip();paragraph=r.data.get('paragraph','').strip()
-    if max(len(outline),len(paragraph))>20000:raise Failure('Il testo inserito è troppo lungo.')
+    chapter=r.require('chapter',500);paragraph=r.require('paragraph',500);outline=r.data.get('outline','').strip()
+    if len(outline)>20000:raise Failure('Il testo inserito è troppo lungo.')
     attachment=r.attachment()
-    if not outline and not paragraph and not attachment:raise Failure('Inserisci l’indice, carica il relativo file oppure indica il titolo del paragrafo.')
     if used and r.data.get('paid')!='yes':raise Failure('Hai già richiesto la prova gratuita. Puoi inviare una richiesta di preventivo.')
     ident=uid();identity=digest(normal(ateneo)+'|'+normal(r.user['matricola']))
     with self.db.connect() as c:
-     self.db.run(c,'INSERT INTO projects(id,user_id,ateneo,faculty,subject,title,outline,paragraph,status,revision,free,identity_key,created,updated) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now()))
+     self.db.run(c,'INSERT INTO projects(id,user_id,ateneo,faculty,subject,title,outline,paragraph,status,revision,free,identity_key,created,updated,chapter) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)',(ident,r.user['id'],ateneo,faculty,subject,title,outline,paragraph,'waiting',0 if used else 1,identity,now(),now(),chapter))
      if attachment:self.save_file(c,ident,None,attachment)
     self.audit(r.user['id'],'project.created:'+ident)
     project=self.query('SELECT * FROM projects WHERE id=?',(ident,),True)
@@ -541,7 +549,7 @@ class Site:
     return self.redirect('/lavori/'+ident)
    except Failure as e:error=e.message
   options='<option value="">Scegli il tuo ateneo</option>'+''.join(f'<option>{esc(x)}</option>' for x in ATENEI)
-  form=f'''<form method="post" class="project-form" data-upload>{r.csrf()}<div class="section-label">01 <span>Il tuo percorso</span></div><label>Ateneo<select name="ateneo" required id="ateneo">{options}</select></label><div id="other-ateneo" hidden>{field('other_ateneo','Nome dell’ateneo',required=False)}</div>{field('faculty','Facoltà / corso di laurea',placeholder='Es. Scienze dell’educazione · L-19')}{field('subject','Materia',placeholder='Es. Pedagogia generale')}<div class="section-label">02 <span>Il tuo progetto</span></div>{field('title','Titolo della tesi',placeholder='Anche provvisorio')}<label>Indice della tesi<textarea name="outline" rows="5" maxlength="20000" placeholder="Incolla qui l’indice, se disponibile…"></textarea></label><label>Oppure carica l’indice<input type="file" id="attachment" accept=".pdf,.docx,.txt"><span class="fine">PDF, Word (.docx) o TXT · massimo 5 MB. Evita dati personali non necessari.</span></label><input type="hidden" name="file_name"><input type="hidden" name="file_data">{field('paragraph','Titolo del paragrafo',required=False,placeholder='Indica il paragrafo da cui iniziare')}<p class="fine">Serve almeno l’indice (testo o file) oppure il titolo del paragrafo.</p>'''
+  form=f'''<form method="post" class="project-form" data-upload>{r.csrf()}<div class="section-label">01 <span>Il tuo percorso</span></div><label>Ateneo<select name="ateneo" required id="ateneo">{options}</select></label><div id="other-ateneo" hidden>{field('other_ateneo','Nome dell’ateneo',required=False)}</div>{field('faculty','Facoltà / corso di laurea',placeholder='Es. Scienze dell’educazione · L-19')}{field('subject','Materia',placeholder='Es. Pedagogia generale')}<div class="section-label">02 <span>Il tuo progetto</span></div>{field('title','Titolo della tesi',placeholder='Anche provvisorio')}{field('chapter','Titolo del capitolo',placeholder='Es. Capitolo 1 · Quadro teorico')}{field('paragraph','Titolo del paragrafo',placeholder='Es. 1.1 Definizioni e prospettive')}<p class="fine">I tre titoli sono necessari per preparare un primo lavoro coerente.</p><label>Indice della tesi (facoltativo)<textarea name="outline" rows="5" maxlength="20000" placeholder="Incolla qui l’indice, se disponibile…"></textarea></label><label>Oppure carica l’indice (facoltativo)<input type="file" id="attachment" accept=".pdf,.docx,.txt"><span class="fine">PDF, Word (.docx) o TXT · massimo 5 MB. Evita dati personali non necessari.</span></label><input type="hidden" name="file_name"><input type="hidden" name="file_data">'''
   if used:form+='<div class="notice">La tua prova gratuita è già stata richiesta. Questa nuova richiesta serve a ricevere un preventivo.</div><label class="check"><input type="checkbox" name="paid" value="yes" required> Richiedo un preventivo senza impegno.</label>'
   form+='<button class="button full">'+('Richiedi un preventivo' if used else 'Invia la richiesta gratuita')+' ↗</button><p class="fine" data-upload-status role="status">Nessun pagamento richiesto in questa fase.</p></form>'
   body=f'<section class="workspace"><a class="back" href="/area">← Torna ai tuoi lavori</a><div class="page-heading"><div><span class="eyebrow">Un nuovo inizio</span><h1>Parlaci della tua tesi.</h1><p>Le informazioni giuste per un primo lavoro su misura.</p></div></div><div class="form-layout"><div class="panel">'+(f'<p class="notice error" role="alert">{esc(error)}</p>' if error else '')+form+'</div><aside><div class="document" id="cover"><div class="doc-university" data-preview="ateneo">Il tuo ateneo</div><div class="doc-rule"></div><p data-preview="faculty">Il tuo corso di laurea</p><span class="doc-kicker">TESI DI LAUREA</span><h2 data-preview="title">Il titolo della tua tesi prende forma qui.</h2><p data-preview="subject">La tua materia</p><div class="doc-bottom">'+esc(r.user['name']+' '+r.user['surname'])+'</div></div><p class="fine">Anteprima orientativa, non frontespizio ufficiale dell’ateneo.</p><div class="aside-note"><h3>E dopo l’invio?</h3><p>Valutiamo il materiale e prepariamo il primo lavoro. Troverai la consegna nella tua area e riceverai un avviso via email.</p></div></aside></div></section>'
@@ -549,9 +557,20 @@ class Site:
  def save_file(self,c,project,event,attachment):
   name,mime,data=attachment;self.db.run(c,'INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(uid(),project,event,name,mime,base64.b64encode(data).decode(),hashlib.sha256(data).hexdigest(),now()))
  def project_action(self,r,p,action):
-  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento']:raise Failure('Azione non valida.',404)
-  if action in ['consegna','preventivo','organizza','conferma-pagamento']:r.admin()
+  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento','messaggio-email','messaggio-whatsapp']:raise Failure('Azione non valida.',404)
+  if action in ['consegna','preventivo','organizza','conferma-pagamento','messaggio-email','messaggio-whatsapp']:r.admin()
   elif r.user['id']!=p['user_id']:raise Failure('Questa azione è riservata allo studente.',403)
+  if action in ['messaggio-email','messaggio-whatsapp']:
+   student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True);body=r.require('message_body',4000)
+   if action=='messaggio-email':
+    recipient=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+    if not recipient:raise Failure('Lo studente non ha indicato un indirizzo email.',409)
+    subject=r.require('message_subject',150)
+    self.mail(recipient,'FormaTesi · '+subject,body+'\n\nAccedi ai tuoi lavori:\n'+self.origin+'/login\n\nFormaTesi')
+    self.audit(r.user['id'],'message.email:'+p['id']);return self.redirect('/lavori/'+p['id'])
+   number=phone_number(student.get('whatsapp',''))
+   if not number:raise Failure('Lo studente non ha indicato un numero WhatsApp valido.',409)
+   self.audit(r.user['id'],'message.whatsapp.opened:'+p['id']);return self.redirect('https://wa.me/'+number+'?text='+urllib.parse.quote(body))
   if action=='consegna':
    recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
    if not (recipient.get('contact_email') or (not recipient['email'].endswith('@pratica.invalid') and recipient['email'])):raise Failure('La consegna non può essere pubblicata finché lo studente non attiva l’email per le notifiche.',409)
@@ -657,7 +676,7 @@ class Site:
    doc.add_paragraph()
   email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
   section_table('Studente e contatti',[('Codice di accesso',student['matricola']),('Username',student.get('username')),('Nome e cognome',(student['name']+' '+student['surname']) if student['name']!='Studente' else 'Non raccolti'),('Email',email),('WhatsApp',student.get('whatsapp')),('Consenso comunicazioni WhatsApp','Sì' if student.get('whatsapp_opt_in') else 'No')])
-  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Priorità',{'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')),('Scadenza interna',date(p['due_at']) if p.get('due_at') else 'Non impostata'),('Nota riservata al gestore',p.get('manager_note')),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
+  section_table('Informazioni sulla tesi',[('Ateneo',p['ateneo']),('Facoltà / corso di laurea',p['faculty']),('Materia',p['subject']),('Titolo della tesi',p['title']),('Titolo del capitolo',p.get('chapter')),('Titolo del paragrafo',p['paragraph']),('Stato',STATUS.get(p['status'],p['status'])),('Numero revisione',p['revision']),('Priorità',{'normal':'Normale','high':'Alta','urgent':'Urgente'}.get(p.get('priority'),'Normale')),('Scadenza interna',date(p['due_at']) if p.get('due_at') else 'Non impostata'),('Nota riservata al gestore',p.get('manager_note')),('Richiesta gratuita','Sì' if p['free'] else 'No'),('Data della richiesta',date(p['created']))])
   for index,payment in enumerate(payments,1):
    labels={'pending':'In attesa di pagamento','proof_submitted':'Comunicata, da verificare','partial':'Pagamento parziale','paid':'Pagato'}
    section_table('Pagamento '+str(index),[('Stato',labels.get(payment['status'],payment['status'])),('Importo previsto','€ '+money(payment['expected_cents'])),('Importo ricevuto e verificato','€ '+money(payment['received_cents'])),('Residuo','€ '+money(max(0,payment['expected_cents']-payment['received_cents']))),('Metodo',payment['method']),('Numero transazione',payment['transaction_ref']),('Contabile caricata',payment['proof_name']),('Nota dello studente',payment['student_note']),('Nota riservata del gestore',payment['manager_note'])])
@@ -728,11 +747,14 @@ class Site:
    student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
    email_link=f'<a href="mailto:{esc(student_email)}">Scrivi via email ↗</a>' if student_email else '<span>Email non disponibile</span>'
    whatsapp_link=f'<a href="https://wa.me/{esc(student.get("whatsapp"))}?text={urllib.parse.quote("Ciao, ti contatto da FormaTesi in merito al tuo lavoro.")}" target="_blank" rel="noopener">Scrivi su WhatsApp ↗</a>' if student.get('whatsapp') else '<span>WhatsApp non indicato</span>'
-   manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
+   default_message='Ciao, ti contatto da FormaTesi in merito al lavoro “'+p['title']+'”. Avrei bisogno di un chiarimento.'
+   email_form=f'''<form method="post" action="/lavori/{p["id"]}/messaggio-email" class="manager-message-form">{r.csrf()}{field('message_subject','Oggetto del messaggio',placeholder='Es. Chiarimento sul materiale inviato')}<label>Messaggio<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button full">Invia email allo studente ↗</button></form>''' if student_email else '<p class="notice">Lo studente non ha un indirizzo email disponibile.</p>'
+   whatsapp_form=f'''<form method="post" action="/lavori/{p["id"]}/messaggio-whatsapp" class="manager-message-form">{r.csrf()}<label>Messaggio WhatsApp<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button secondary full">Apri il messaggio su WhatsApp ↗</button><p class="fine">Si apre la chat con il testo già preparato: premi Invia dentro WhatsApp.</p></form>''' if student.get('whatsapp') else '<p class="notice">Lo studente non ha indicato un numero WhatsApp.</p>'
+   manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><details class="manager-message" open><summary>Contatta lo studente</summary><div class="message-channel"><h3>Email</h3>{email_form}</div><div class="message-channel"><h3>WhatsApp</h3>{whatsapp_form}</div></details><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
    due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
    organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
   receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando la prova metodologica sarà disponibile.</p></div>' if not admin and not events else ''
-  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Paragrafo richiesto</dt><dd>{esc(p["paragraph"] or "Da individuare nell’indice")}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Titolo della tesi</dt><dd>{esc(p["title"])}</dd><dt>Titolo del capitolo</dt><dd>{esc(p.get("chapter") or "Non indicato")}</dd><dt>Titolo del paragrafo</dt><dd>{esc(p["paragraph"])}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
 class Request:
@@ -773,7 +795,7 @@ class Request:
   if not self.user or self.user['role']!='admin':raise Failure('Accesso riservato.',403)
  def require(self,key,maximum):
   v=self.data.get(key,'').strip()
-  if not v or len(v)>maximum:raise Failure('Controlla il campo '+{'faculty':'facoltà / corso','subject':'materia','title':'titolo','ateneo':'ateneo','body':'descrizione','name':'nome','surname':'cognome','matricola':'matricola'}.get(key,key)+'.')
+  if not v or len(v)>maximum:raise Failure('Controlla il campo '+{'faculty':'facoltà / corso','subject':'materia','title':'titolo della tesi','chapter':'titolo del capitolo','paragraph':'titolo del paragrafo','message_subject':'oggetto del messaggio','message_body':'testo del messaggio','ateneo':'ateneo','body':'descrizione','name':'nome','surname':'cognome','matricola':'matricola'}.get(key,key)+'.')
   return v
  def password(self):
   value=self.data.get('password','')
