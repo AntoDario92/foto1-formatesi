@@ -66,6 +66,14 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(self.student.call(url+'/riepilogo.docx'),403)
   self.admin.call(url);self.assertEqual(self.admin.call(url+'/riepilogo.docx'),200)
   self.assertTrue(self.admin.body.startswith('PK'));self.assertIn('attachment;',self.admin.headers['Content-Disposition'])
+ def test_manager_sees_all_registered_students_even_without_projects(self):
+  self.admin.call('/area')
+  self.assertIn('Studenti registrati (2)',self.admin.body)
+  self.assertIn('a@example.com',self.admin.body);self.assertIn('b@example.com',self.admin.body)
+  self.assertEqual(self.admin.body.count('Nessun lavoro inviato'),2)
+  self.new();self.admin.call('/area')
+  self.assertIn('1 lavoro',self.admin.body);self.assertIn('/area?q=a',self.admin.body)
+  self.student.call('/area');self.assertNotIn('ANAGRAFICA ACCOUNT',self.student.body)
  def test_manager_can_send_email_or_prepare_whatsapp_message(self):
   self.app.mutate('UPDATE users SET contact_email=?,whatsapp=?,whatsapp_opt_in=1 WHERE email=?',('a@example.com','393501234567','a@example.com'))
   url=self.new();self.admin.call(url)
