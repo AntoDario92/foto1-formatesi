@@ -517,13 +517,29 @@ class Site:
    mail+=contacts
   actions='<div class="admin-actions"><a class="button" href="/gestione/notifiche">Controlla notifiche</a><a class="button secondary" href="/gestione/recensioni">Gestisci recensioni</a></div>' if admin else '<a class="button" href="/nuovo">Richiedi un nuovo lavoro +</a>'
   insights=''
+  student_directory=''
   if admin:
-   students=self.query("SELECT COUNT(*) AS n FROM users WHERE role='student'",one=True)['n']
+   student_accounts=self.query("SELECT u.*,(SELECT COUNT(*) FROM projects p WHERE p.user_id=u.id) AS project_count FROM users u WHERE u.role='student' ORDER BY u.created DESC")
+   students=len(student_accounts)
    deliveries=self.query("SELECT COUNT(*) AS n FROM events WHERE kind='delivery'",one=True)['n']
    accepted=self.query("SELECT COUNT(*) AS n FROM quotes WHERE status='accepted'",one=True)['n']
    urgent=sum(p.get('priority')=='urgent' for p in projects)
    insights=f'<section class="manager-overview"><div><strong>{students}</strong><span>Account studenti</span></div><div><strong>{len(projects)}</strong><span>Richieste ricevute</span></div><div><strong>{deliveries}</strong><span>Consegne pubblicate</span></div><div><strong>{accepted}</strong><span>Proposte accettate</span></div><div class="urgent-metric"><strong>{urgent}</strong><span>Lavori urgenti</span></div></section>'
-  body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}{insights}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
+   rows=[]
+   for student in student_accounts:
+    contact=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
+    whatsapp=student.get('whatsapp') or ''
+    identifier=student.get('username') or student['matricola']
+    full_name=' '.join(x for x in [student.get('name'),student.get('surname')] if x).strip()
+    count=int(student.get('project_count') or 0);work_label='1 lavoro' if count==1 else f'{count} lavori'
+    contacts=(f'<a href="mailto:{esc(contact)}">{esc(contact)}</a>' if contact else '<span class="missing-contact">Email non indicata</span>')
+    if whatsapp:contacts+=f'<a href="https://wa.me/{esc(whatsapp)}" target="_blank" rel="noopener">WhatsApp +{esc(whatsapp)}</a>'
+    account_details=f'<span>Codice: <b>{esc(student["matricola"])}</b></span>'
+    if student.get('username'):account_details+=f'<span>Username: <b>{esc(student["username"])}</b></span>'
+    work_action=f'<a class="button small" href="/area?q={urllib.parse.quote(identifier)}">Vedi {work_label}</a>' if count else '<span class="student-no-work">Nessun lavoro inviato</span>'
+    rows.append(f'<article class="student-account"><div class="student-account-main"><span class="student-avatar" aria-hidden="true">{esc((full_name or identifier)[:1].upper())}</span><div><h3>{esc(full_name or "Studente FormaTesi")}</h3><div class="student-identifiers">{account_details}</div></div></div><div class="student-contacts">{contacts}</div><div class="student-registration"><span>Registrato il</span><b>{date(student["created"])}</b></div><div class="student-work-count"><strong>{count}</strong><span>{"Lavoro associato" if count==1 else "Lavori associati"}</span></div>{work_action}</article>')
+   student_directory=f'<details class="panel student-directory" open><summary><span><span class="eyebrow">ANAGRAFICA ACCOUNT</span><strong>Studenti registrati ({students})</strong></span></summary><p class="student-directory-intro">Qui compaiono tutti gli account, anche quelli che non hanno ancora inviato una richiesta.</p><div class="student-account-list">{"".join(rows) if rows else "<div class=\"empty compact\">Nessuno studente registrato.</div>"}</div></details>'
+  body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}{insights}{student_directory}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
   return self.page(r,'I miei lavori' if not admin else 'Gestione lavori',body),200,[]
  def new_project(self,r):
   error=''
