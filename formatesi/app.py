@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,quote_id TEXT NOT NULL U
 CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,user_id TEXT,action TEXT NOT NULL,created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,email TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS communications(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,actor_id TEXT NOT NULL REFERENCES users(id),channel TEXT NOT NULL,subject TEXT NOT NULL DEFAULT '',body TEXT NOT NULL,outbox_id TEXT REFERENCES outbox(id),created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body TEXT NOT NULL,rating INTEGER NOT NULL,review_url TEXT NOT NULL,review_date TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 1,created BIGINT NOT NULL);'''
   with self.connect() as c:
    for q in schema.split(';'):
@@ -153,8 +154,8 @@ class Site:
    if r['count']>maximum:raise Failure('Troppi tentativi. Riprova tra qualche minuto.',429)
  def mail(self,email,subject,body):
   ident=uid();self.mutate('INSERT INTO outbox(id,email,subject,body,sent,created,attempts,last_error,sent_at) VALUES(?,?,?,?,0,?,0,NULL,NULL)',(ident,email,subject,body,now()))
-  if self.testing:return
-  self.send_mail(ident,email,subject,body)
+  if not self.testing:self.send_mail(ident,email,subject,body)
+  return ident
  def send_mail(self,ident,email,subject,body):
   try:
    sender_email=self.cfg['MAIL_FROM'].strip()
@@ -165,7 +166,7 @@ class Site:
    req=urllib.request.Request('https://api.brevo.com/v3/smtp/email',data=payload,headers={'api-key':self.cfg['BREVO_API_KEY'],'Accept':'application/json','Content-Type':'application/json'})
    with urllib.request.urlopen(req,timeout=8) as response:
     if response.status not in (200,201):return
-   self.mutate('UPDATE outbox SET sent=1,body=?,attempts=attempts+1,last_error=NULL,sent_at=? WHERE id=?',('[Messaggio inviato]',now(),ident))
+   self.mutate('UPDATE outbox SET sent=1,attempts=attempts+1,last_error=NULL,sent_at=? WHERE id=?',(now(),ident))
   except Exception as exc:
    self.mutate('UPDATE outbox SET attempts=attempts+1,last_error=? WHERE id=?',(str(exc)[:500],ident))
    import logging;logging.exception('Email FormaTesi non inviata') # Retained outbox permits an explicit admin retry without losing deliveries.
@@ -566,10 +567,12 @@ class Site:
     recipient=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
     if not recipient:raise Failure('Lo studente non ha indicato un indirizzo email.',409)
     subject=r.require('message_subject',150)
-    self.mail(recipient,'FormaTesi · '+subject,body+'\n\nAccedi ai tuoi lavori:\n'+self.origin+'/login\n\nFormaTesi')
+    outbox_id=self.mail(recipient,'FormaTesi · '+subject,body+'\n\nAccedi ai tuoi lavori:\n'+self.origin+'/login\n\nFormaTesi')
+    self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'email',subject,body,outbox_id,now()))
     self.audit(r.user['id'],'message.email:'+p['id']);return self.redirect('/lavori/'+p['id'])
    number=phone_number(student.get('whatsapp',''))
    if not number:raise Failure('Lo studente non ha indicato un numero WhatsApp valido.',409)
+   self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,NULL,?)',(uid(),p['id'],r.user['id'],'whatsapp','Messaggio WhatsApp preparato',body,now()))
    self.audit(r.user['id'],'message.whatsapp.opened:'+p['id']);return self.redirect('https://wa.me/'+number+'?text='+urllib.parse.quote(body))
   if action=='consegna':
    recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
@@ -742,6 +745,7 @@ class Site:
    payment_html+=f'<section class="panel payment-card"><div class="payment-heading"><div><span class="eyebrow">SITUAZIONE PAGAMENTO</span><h2>{status_label}</h2></div><span class="payment-status payment-{payment["status"]}">{status_label}</span></div>{totals}{reference}{proof}{form}</section>'
   contact=self.cfg.get('WHATSAPP_NUMBER','393505815735');contact_html=f'<a class="button secondary" href="https://wa.me/{esc(contact)}?text={urllib.parse.quote("Ciao FormaTesi, vorrei una consulenza per la mia tesi.")}">Parliamone su WhatsApp ↗</a>' if re.fullmatch(r'\d{8,15}',contact) else f'<a class="secondary" href="{FB}">Contatta FormaTesi su Facebook ↗</a>'
   manager_contacts=''
+  communications_html=''
   organizer=''
   if admin:
    student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
@@ -751,10 +755,18 @@ class Site:
    email_form=f'''<form method="post" action="/lavori/{p["id"]}/messaggio-email" class="manager-message-form">{r.csrf()}{field('message_subject','Oggetto del messaggio',placeholder='Es. Chiarimento sul materiale inviato')}<label>Messaggio<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button full">Invia email allo studente ↗</button></form>''' if student_email else '<p class="notice">Lo studente non ha un indirizzo email disponibile.</p>'
    whatsapp_form=f'''<form method="post" action="/lavori/{p["id"]}/messaggio-whatsapp" class="manager-message-form">{r.csrf()}<label>Messaggio WhatsApp<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button secondary full">Apri il messaggio su WhatsApp ↗</button><p class="fine">Si apre la chat con il testo già preparato: premi Invia dentro WhatsApp.</p></form>''' if student.get('whatsapp') else '<p class="notice">Lo studente non ha indicato un numero WhatsApp.</p>'
    manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd><dt>Email</dt><dd>{email_link}</dd><dt>WhatsApp</dt><dd>{esc(student.get("whatsapp") or "Non indicato")}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd></dl><div class="contact-actions">{email_link}{whatsapp_link}</div><details class="manager-message" open><summary>Contatta lo studente</summary><div class="message-channel"><h3>Email</h3>{email_form}</div><div class="message-channel"><h3>WhatsApp</h3>{whatsapp_form}</div></details><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
+   communications=self.query('SELECT c.*,o.sent,o.last_error FROM communications c LEFT JOIN outbox o ON o.id=c.outbox_id WHERE c.project_id=? ORDER BY c.created DESC,c.id DESC',(p['id'],))
+   rows=''
+   for item in communications:
+    if item['channel']=='email':state='Inviata' if item.get('sent') else ('Da reinviare' if item.get('last_error') else 'In coda');state_class='sent' if item.get('sent') else 'pending'
+    else:state='Chat aperta · invio da confermare in WhatsApp';state_class='prepared'
+    rows+=f'<article class="communication-item"><div class="communication-heading"><span class="communication-channel {esc(item["channel"])}">{esc(item["channel"])}</span><time>{date(item["created"])}</time></div><h3>{esc(item["subject"])}</h3><div class="prose">{esc(item["body"])}</div><span class="communication-state {state_class}">{esc(state)}</span></article>'
+   if not rows:rows='<div class="empty compact"><h3>Nessuna comunicazione archiviata.</h3><p>Le email e i messaggi WhatsApp preparati da questa scheda compariranno qui.</p></div>'
+   communications_html=f'<section class="panel communications-history"><span class="eyebrow">STORICO COMUNICAZIONI</span><h2>Email e messaggi</h2><p class="fine">Archivio collegato esclusivamente a questo lavoro.</p><div class="communications-list">{rows}</div></section>'
    due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
    organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
   receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando la prova metodologica sarà disponibile.</p></div>' if not admin and not events else ''
-  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Titolo della tesi</dt><dd>{esc(p["title"])}</dd><dt>Titolo del capitolo</dt><dd>{esc(p.get("chapter") or "Non indicato")}</dd><dt>Titolo del paragrafo</dt><dd>{esc(p["paragraph"])}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
+  body=f'<section class="workspace"><a class="back" href="/area">← Tutti i lavori</a><div class="page-heading"><div><span class="eyebrow">{esc(p["ateneo"])} · {"Prova gratuita" if p["free"] else "Richiesta di preventivo"}</span><h1 class="project-title">{esc(p["title"])}</h1>{badge(p)}</div></div>{receipt}{warnings}<div class="detail-layout"><div><section class="panel"><h2>Il percorso del lavoro</h2><div class="timeline">{history}</div></section>{editor}{communications_html}</div><aside>{manager_contacts}{organizer}<section class="panel"><span class="eyebrow">La scheda del progetto</span><dl><dt>Studente</dt><dd>{esc(student["name"]+" "+student["surname"])}</dd><dt>Facoltà / corso</dt><dd>{esc(p["faculty"])}</dd><dt>Materia</dt><dd>{esc(p["subject"])}</dd><dt>Titolo della tesi</dt><dd>{esc(p["title"])}</dd><dt>Titolo del capitolo</dt><dd>{esc(p.get("chapter") or "Non indicato")}</dd><dt>Titolo del paragrafo</dt><dd>{esc(p["paragraph"])}</dd><dt>Data di richiesta</dt><dd>{date(p["created"])}</dd></dl><details><summary>Indice e materiali iniziali</summary><div class="prose">{esc(p["outline"])}</div>'+''.join(file_link(f) for f in files if not f['event_id'])+f'</details></section>{payment_html}{proposal}{contact_html}</aside></div></section>'
   return self.page(r,p['title'],body),200,[]
 
 class Request:
