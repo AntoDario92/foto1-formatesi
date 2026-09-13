@@ -62,6 +62,7 @@ class PortalTests(unittest.TestCase):
   self.assertIn('Studente: a',self.admin.body);self.assertIn('Codice: a',self.admin.body);self.assertIn('a@example.com',self.admin.body);self.assertIn('393501234567',self.admin.body)
   self.admin.call(url)
   self.assertIn('CONTATTI DELLO STUDENTE',self.admin.body);self.assertIn('mailto:a@example.com',self.admin.body);self.assertIn('wa.me/393501234567',self.admin.body);self.assertIn('Scarica riepilogo Word',self.admin.body)
+  self.assertIn('<b>A</b>a@example.com',self.admin.body);self.assertIn('<b>A</b>+393501234567',self.admin.body)
   self.assertEqual(self.student.call(url+'/riepilogo.docx'),403)
   self.admin.call(url);self.assertEqual(self.admin.call(url+'/riepilogo.docx'),200)
   self.assertTrue(self.admin.body.startswith('PK'));self.assertIn('attachment;',self.admin.headers['Content-Disposition'])
@@ -81,6 +82,12 @@ class PortalTests(unittest.TestCase):
   whatsapp=self.app.query("SELECT * FROM communications WHERE project_id=? AND channel='whatsapp'",(url.rsplit('/',1)[-1],),True)
   self.assertIn('confermare il titolo',whatsapp['body']);self.assertIsNone(whatsapp['outbox_id'])
   self.student.call(url);self.assertEqual(self.student.post(url+'/messaggio-email',message_subject='No',message_body='No'),403)
+ def test_manager_only_sees_contact_channels_supplied_by_student(self):
+  url=self.new();self.admin.call(url)
+  self.assertIn('/messaggio-email',self.admin.body);self.assertNotIn('/messaggio-whatsapp',self.admin.body)
+  self.app.mutate('UPDATE users SET contact_email=NULL,email=?,whatsapp=? WHERE email=?',('a@pratica.invalid','393501234567','a@example.com'))
+  self.admin.call(url)
+  self.assertNotIn('/messaggio-email',self.admin.body);self.assertIn('/messaggio-whatsapp',self.admin.body)
  def test_trial_limit_and_quote(self):
   url=self.new();self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='Altro',chapter='C',paragraph='P'),200);self.assertIn('già richiesto la prova gratuita',self.student.body)
   self.assertEqual(len(self.app.query('SELECT * FROM projects')),1)
