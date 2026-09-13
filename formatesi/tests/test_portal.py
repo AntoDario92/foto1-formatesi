@@ -20,11 +20,11 @@ class PortalTests(unittest.TestCase):
  def tearDown(self):self.tmp.cleanup()
  def register(self,email):
   c=Client(self.app);c.call('/registrati');self.assertEqual(c.post('/registrati',name='Anna',surname='Rossi',email=email,matricola=email.split('@')[0],password='Una password lunga 123',terms='yes'),200)
-  m=self.app.query('SELECT * FROM outbox WHERE email=? ORDER BY created DESC',(email,),True);token=m['body'].split('token=')[1]
+  m=self.app.query("SELECT * FROM outbox WHERE email=? AND subject='Verifica il tuo account FormaTesi' ORDER BY created DESC",(email,),True);token=m['body'].split('token=')[1]
   self.assertEqual(c.call('/verifica?token='+token),200)
   c.call('/login');self.assertEqual(c.post('/login',email=email,password='Una password lunga 123'),303);c.call('/area');return c
  def new(self):
-  self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='Scienze L-19',subject='Pedagogia',title='Il gioco e apprendimento',paragraph='Il ruolo educativo',file_name='indice.txt',file_data=base64.b64encode(b'1. Il gioco').decode()),303);return self.student.headers['Location']
+  self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='Scienze L-19',subject='Pedagogia',title='Il gioco e apprendimento',chapter='Capitolo 1 · Il gioco',paragraph='Il ruolo educativo',file_name='indice.txt',file_data=base64.b64encode(b'1. Il gioco').decode()),303);return self.student.headers['Location']
  def test_workflow_isolation_and_revisions(self):
   url=self.new();self.assertEqual(self.student.call(url),200)
   self.assertEqual(self.other.call(url),404)
@@ -44,7 +44,7 @@ class PortalTests(unittest.TestCase):
  def test_notification_flow(self):
   url=self.new()
   admin_mail=self.app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('owner@example.com','Nuova richiesta di consulenza FormaTesi'),True)
-  self.assertIn('Anna Rossi',admin_mail['body']);self.assertIn('eCampus',admin_mail['body']);self.assertIn('Pedagogia',admin_mail['body'])
+  self.assertIn('Anna Rossi',admin_mail['body']);self.assertIn('eCampus',admin_mail['body']);self.assertIn('Pedagogia',admin_mail['body']);self.assertIn('Capitolo 1',admin_mail['body'])
   received=self.app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('a@example.com','Abbiamo ricevuto la tua richiesta FormaTesi'),True)
   self.assertIn('/lavori/',received['body'])
   self.admin.call(url);self.assertEqual(self.admin.post(url+'/consegna',body='Prima consegna',version='0',status='waiting'),303)
@@ -65,8 +65,19 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(self.student.call(url+'/riepilogo.docx'),403)
   self.admin.call(url);self.assertEqual(self.admin.call(url+'/riepilogo.docx'),200)
   self.assertTrue(self.admin.body.startswith('PK'));self.assertIn('attachment;',self.admin.headers['Content-Disposition'])
+ def test_manager_can_send_email_or_prepare_whatsapp_message(self):
+  self.app.mutate('UPDATE users SET contact_email=?,whatsapp=?,whatsapp_opt_in=1 WHERE email=?',('a@example.com','393501234567','a@example.com'))
+  url=self.new();self.admin.call(url)
+  self.assertIn('Contatta lo studente',self.admin.body);self.assertIn('Invia email allo studente',self.admin.body)
+  self.assertEqual(self.admin.post(url+'/messaggio-email',message_subject='Serve un chiarimento',message_body='Puoi confermare il titolo del secondo capitolo?'),303)
+  sent=self.app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('a@example.com','FormaTesi · Serve un chiarimento'),True)
+  self.assertIn('secondo capitolo',sent['body']);self.assertIn('/login',sent['body'])
+  self.admin.call(url)
+  self.assertEqual(self.admin.post(url+'/messaggio-whatsapp',message_body='Puoi confermare il titolo?'),303)
+  self.assertTrue(self.admin.headers['Location'].startswith('https://wa.me/393501234567?text='))
+  self.student.call(url);self.assertEqual(self.student.post(url+'/messaggio-email',message_subject='No',message_body='No'),403)
  def test_trial_limit_and_quote(self):
-  url=self.new();self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='Altro',paragraph='P'),200);self.assertIn('già richiesto la prova gratuita',self.student.body)
+  url=self.new();self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='Altro',chapter='C',paragraph='P'),200);self.assertIn('già richiesto la prova gratuita',self.student.body)
   self.assertEqual(len(self.app.query('SELECT * FROM projects')),1)
   self.admin.call(url);self.assertEqual(self.admin.post(url+'/preventivo',amount='125,50',description='Revisione di un capitolo. Due revisioni incluse. 7 giorni.'),303)
   q=self.app.query('SELECT * FROM quotes',one=True);self.assertEqual(q['cents'],12550)
@@ -105,12 +116,12 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(c.post('/reimposta',token=token,password='Nuova password lunga 789'),200);self.assertIn('non valido',c.body)
  def test_public_gate_and_file_rejection(self):
   closed=Client(Site({}));self.assertEqual(closed.call('/'),200);self.assertEqual(closed.call('/registrati'),503);self.assertEqual(closed.call('/anteprima'),200)
-  self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='T',paragraph='P',file_name='evil.pdf',file_data=base64.b64encode(b'not PDF').decode()),200);self.assertIn('non è un PDF valido',self.student.body)
+  self.student.call('/nuovo');self.assertEqual(self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='T',chapter='C',paragraph='P',file_name='evil.pdf',file_data=base64.b64encode(b'not PDF').decode()),200);self.assertIn('non è un PDF valido',self.student.body)
   self.assertEqual(len(self.app.query('SELECT * FROM projects')),0)
  def test_missing_information_and_admin_role(self):
   self.assertEqual(self.app.query('SELECT role FROM users WHERE email=?',('a@example.com',),True)['role'],'student')
   self.assertEqual(self.app.query('SELECT role FROM users WHERE email=?',('owner@example.com',),True)['role'],'admin')
-  self.student.call('/nuovo');self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='T');self.assertIn('titolo del paragrafo',self.student.body);self.assertEqual(len(self.app.query('SELECT * FROM projects')),0)
+  self.student.call('/nuovo');self.student.post('/nuovo',ateneo='eCampus',faculty='F',subject='S',title='T',paragraph='P');self.assertIn('titolo del capitolo',self.student.body);self.assertEqual(len(self.app.query('SELECT * FROM projects')),0)
  def test_facebook_ticket_registration(self):
   self.app.cfg.update(FACEBOOK_APP_ID='123',FACEBOOK_APP_SECRET='test-secret')
   payload={'id':'fb-44','name':'Lucia','surname':'Verdi','email':'lucia@example.com','exp':9999999999}
@@ -122,6 +133,7 @@ class PortalTests(unittest.TestCase):
   self.assertEqual(c.post('/registrati-facebook',ticket=ticket,matricola='M-998',terms='yes'),303)
   user=self.app.query('SELECT * FROM users WHERE email=?',('lucia@example.com',),True)
   self.assertEqual(user['facebook_id'],'fb-44');self.assertEqual(user['matricola'],'M-998');self.assertEqual(user['verified'],1)
+  self.assertIsNotNone(self.app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('owner@example.com','Nuovo account studente FormaTesi'),True))
   c.call('/area');self.assertIn('I miei lavori.',c.body);self.assertNotIn('ATTIVA LE NOTIFICHE',c.body)
   bad=Client(self.app);bad.call('/registrati-facebook?ticket='+urllib.parse.quote(ticket+'x'));self.assertIn('scaduta',bad.body)
  def test_verified_facebook_reviews(self):
@@ -145,6 +157,8 @@ class PortalTests(unittest.TestCase):
   self.assertNotIn('matricola universitaria',c.body.lower());self.assertIn(user['matricola'],c.body)
   notice=app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('avvisi@example.com','Il tuo accesso personale FormaTesi'),True)
   self.assertIn('accedere ai tuoi progetti',notice['body'])
+  manager_notice=app.query("SELECT * FROM outbox WHERE email=? AND subject=?",('owner@example.com','Nuovo account studente FormaTesi'),True)
+  self.assertIn('avvisi@example.com',manager_notice['body']);self.assertIn(user['matricola'],manager_notice['body'])
   c.call('/logout',{'csrf':c.csrf});c.call('/login')
   self.assertEqual(c.post('/login',identifier=user['matricola'],password='Una password anonima 123'),303)
   self.assertEqual(c.call('/area'),200)
