@@ -574,16 +574,22 @@ class Site:
  def save_file(self,c,project,event,attachment):
   name,mime,data=attachment;self.db.run(c,'INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(uid(),project,event,name,mime,base64.b64encode(data).decode(),hashlib.sha256(data).hexdigest(),now()))
  def project_action(self,r,p,action):
-  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento','messaggio-email','messaggio-whatsapp']:raise Failure('Azione non valida.',404)
+  if action not in ['revisione','consegna','preventivo','accetta','richiedi-preventivo','organizza','pagamento','conferma-pagamento','messaggio-email','messaggio-whatsapp','risposta-portale']:raise Failure('Azione non valida.',404)
   if action in ['consegna','preventivo','organizza','conferma-pagamento','messaggio-email','messaggio-whatsapp']:r.admin()
   elif r.user['id']!=p['user_id']:raise Failure('Questa azione è riservata allo studente.',403)
+  if action=='risposta-portale':
+   body=r.require('message_body',4000)
+   subject=(r.data.get('message_subject') or 'Risposta dello studente').strip()[:150]
+   self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,NULL,?)',(uid(),p['id'],r.user['id'],'portale',subject,body,now()))
+   self.notify_admin(p,'Nuovo messaggio dello studente FormaTesi','Lo studente ha risposto dalla propria area personale.\n\nMessaggio:\n'+body)
+   self.audit(r.user['id'],'message.portal:'+p['id']);return self.redirect('/lavori/'+p['id'])
   if action in ['messaggio-email','messaggio-whatsapp']:
    student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True);body=r.require('message_body',4000)
    if action=='messaggio-email':
     recipient=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
     if not recipient:raise Failure('Lo studente non ha indicato un indirizzo email.',409)
     subject=r.require('message_subject',150)
-    outbox_id=self.mail(recipient,'FormaTesi · '+subject,body+'\n\nAccedi ai tuoi lavori:\n'+self.origin+'/login\n\nFormaTesi')
+    outbox_id=self.mail(recipient,'FormaTesi · '+subject,body+'\n\nPer rispondere e conservare la conversazione nello storico, apri questo lavoro nella tua area personale:\n'+self.origin+'/lavori/'+p['id']+'\n\nFormaTesi')
     self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'email',subject,body,outbox_id,now()))
     self.audit(r.user['id'],'message.email:'+p['id']);return self.redirect('/lavori/'+p['id'])
    number=phone_number(student.get('whatsapp',''))
@@ -763,6 +769,20 @@ class Site:
   manager_contacts=''
   communications_html=''
   organizer=''
+  communications=self.query('SELECT c.*,u.role AS actor_role,o.sent,o.last_error FROM communications c JOIN users u ON u.id=c.actor_id LEFT JOIN outbox o ON o.id=c.outbox_id WHERE c.project_id=? ORDER BY c.created DESC,c.id DESC',(p['id'],))
+  rows=''
+  for item in communications:
+   if item['channel']=='email':state='Inviata' if item.get('sent') else ('Da reinviare' if item.get('last_error') else 'In coda');state_class='sent' if item.get('sent') else 'pending'
+   elif item['channel']=='portale':state='Risposta ricevuta nel portale';state_class='received'
+   else:state='Chat aperta · invio da confermare in WhatsApp';state_class='prepared'
+   author='Studente' if item.get('actor_role')=='student' else 'FormaTesi'
+   rows+=f'<article class="communication-item"><div class="communication-heading"><span class="communication-channel {esc(item["channel"])}">{esc(item["channel"])}</span><time>{date(item["created"])}</time></div><span class="communication-author">DA: {author}</span><h3>{esc(item["subject"])}</h3><div class="prose">{esc(item["body"])}</div><span class="communication-state {state_class}">{esc(state)}</span></article>'
+  if admin:
+   if not rows:rows='<div class="empty compact"><h3>Nessuna comunicazione archiviata.</h3><p>Le email, i messaggi WhatsApp e le risposte dal portale compariranno qui.</p></div>'
+   communications_html=f'<section class="panel communications-history"><span class="eyebrow">STORICO COMUNICAZIONI</span><h2>Email e messaggi</h2><p class="fine">Archivio collegato esclusivamente a questo lavoro.</p><div class="communications-list">{rows}</div></section>'
+  else:
+   thread=f'<div class="communications-list">{rows}</div>' if rows else '<p class="fine">Non ci sono ancora messaggi in questa conversazione.</p>'
+   communications_html=f'<section class="panel student-reply"><span class="eyebrow">COMUNICAZIONI</span><h2>Scrivi a FormaTesi</h2><p>Usa questo spazio per rispondere a un’email o chiedere un chiarimento. Il messaggio resterà salvato insieme al lavoro.</p><form method="post" action="/lavori/{p["id"]}/risposta-portale">{r.csrf()}{field("message_subject","Oggetto",required=False,placeholder="Es. Risposta alla richiesta di chiarimento")}<label>Messaggio<textarea name="message_body" rows="5" maxlength="4000" required></textarea></label><button class="button full">Invia il messaggio a FormaTesi ↗</button></form><details class="student-thread" {"open" if rows else ""}><summary>Storico della conversazione</summary>{thread}</details></section>'
   if admin:
    student_email=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
    email_link=f'<a href="mailto:{esc(student_email)}">Scrivi via email ↗</a>' if student_email else ''
@@ -777,14 +797,6 @@ class Site:
    email_row=f'<dt>Email</dt><dd>{esc(student_email)}</dd>' if student_email else ''
    whatsapp_row=f'<dt>WhatsApp</dt><dd>+{esc(student["whatsapp"])}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd>' if student.get('whatsapp') else ''
    manager_contacts=f'<section class="panel manager-contacts"><span class="eyebrow">CONTATTI DELLO STUDENTE</span><dl><dt>Codice di accesso</dt><dd>{esc(student["matricola"])}</dd><dt>Username</dt><dd>{esc(student.get("username") or "Non scelto")}</dd>{email_row}{whatsapp_row}</dl><div class="contact-actions">{email_link}{whatsapp_link}</div><details class="manager-message" open><summary>Contatta lo studente</summary>{channels}</details><a class="button full" href="/lavori/{p["id"]}/riepilogo.docx">Scarica riepilogo Word ↓</a></section>'
-   communications=self.query('SELECT c.*,o.sent,o.last_error FROM communications c LEFT JOIN outbox o ON o.id=c.outbox_id WHERE c.project_id=? ORDER BY c.created DESC,c.id DESC',(p['id'],))
-   rows=''
-   for item in communications:
-    if item['channel']=='email':state='Inviata' if item.get('sent') else ('Da reinviare' if item.get('last_error') else 'In coda');state_class='sent' if item.get('sent') else 'pending'
-    else:state='Chat aperta · invio da confermare in WhatsApp';state_class='prepared'
-    rows+=f'<article class="communication-item"><div class="communication-heading"><span class="communication-channel {esc(item["channel"])}">{esc(item["channel"])}</span><time>{date(item["created"])}</time></div><h3>{esc(item["subject"])}</h3><div class="prose">{esc(item["body"])}</div><span class="communication-state {state_class}">{esc(state)}</span></article>'
-   if not rows:rows='<div class="empty compact"><h3>Nessuna comunicazione archiviata.</h3><p>Le email e i messaggi WhatsApp preparati da questa scheda compariranno qui.</p></div>'
-   communications_html=f'<section class="panel communications-history"><span class="eyebrow">STORICO COMUNICAZIONI</span><h2>Email e messaggi</h2><p class="fine">Archivio collegato esclusivamente a questo lavoro.</p><div class="communications-list">{rows}</div></section>'
    due_value=datetime.datetime.fromtimestamp(p['due_at'],datetime.timezone.utc).strftime('%Y-%m-%d') if p.get('due_at') else ''
    organizer=f'<details class="panel organizer" open><summary>Organizza il lavoro</summary><form method="post" action="/lavori/{p["id"]}/organizza">{r.csrf()}<label>Priorità<select name="priority"><option value="normal" {"selected" if p.get("priority")=="normal" else ""}>Normale</option><option value="high" {"selected" if p.get("priority")=="high" else ""}>Alta</option><option value="urgent" {"selected" if p.get("priority")=="urgent" else ""}>Urgente</option></select></label><label>Scadenza interna<input type="date" name="due_date" value="{due_value}"></label><label>Nota riservata al gestore<textarea name="manager_note" rows="4" maxlength="2000">{esc(p.get("manager_note"))}</textarea></label><button class="button full">Salva organizzazione</button></form></details>'
   receipt='<div class="notice success"><strong>RICHIESTA RICEVUTA.</strong><p>È salvata nel tuo account. Ti avviseremo via email quando la prova metodologica sarà disponibile.</p></div>' if not admin and not events else ''
