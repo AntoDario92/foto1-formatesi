@@ -554,9 +554,7 @@ class Site:
     contacts=(f'<a class="student-contact-pill email" href="mailto:{esc(contact)}" title="{esc(contact)}"><span>Email</span>{esc(contact)}</a>' if contact else '<span class="student-contact-pill missing-contact">Email non indicata</span>')
     if whatsapp:contacts+=f'<a class="student-contact-pill whatsapp" href="https://wa.me/{esc(whatsapp)}" target="_blank" rel="noopener"><span>WhatsApp</span>+{esc(whatsapp)}</a>'
     display_name=student.get('username') or student['matricola']
-    real_name=full_name if student.get('name')!='Studente' else 'Account studente'
-    account_details=f'<span>{esc(real_name)}</span>'
-    if student.get('username'):account_details+=f'<span class="student-code">Codice {esc(student["matricola"])}</span>'
+    account_details=f'<span>{"Codice " if student.get("username") else "Accesso con codice · "}{esc(student["matricola"])}</span>'
     work_action=f'<a class="button small" href="/area?q={urllib.parse.quote(identifier)}">Vedi {work_label}</a>' if count else '<span class="student-no-work">Nessun lavoro inviato</span>'
     rows.append(f'<article class="student-account"><div class="student-account-main"><span class="student-avatar" aria-hidden="true">{esc(display_name[:1].upper())}</span><div class="student-identity"><h3>{esc(display_name)}</h3><div class="student-identifiers">{account_details}</div></div></div><div class="student-contacts">{contacts}</div><div class="student-work-count"><strong>{count}</strong><span>{"lavoro" if count==1 else "lavori"}</span></div>{work_action}</article>')
    student_directory=f'<details class="panel student-directory" open><summary><span><span class="eyebrow">ANAGRAFICA ACCOUNT</span><strong>Studenti registrati ({students})</strong></span></summary><p class="student-directory-intro">Una riga per ogni studente, compresi gli account senza richieste.</p><div class="student-table-head"><span>Studente e accesso</span><span>Contatti</span><span>Lavori</span><span>Azione</span></div><div class="student-account-list">{"".join(rows) if rows else "<div class=\"empty compact\">Nessuno studente registrato.</div>"}</div></details>'
