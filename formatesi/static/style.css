@@ -243,3 +243,17 @@ footer a[href*="facebook.com"]:before{color:#1877f2}footer a[href*="m.me"]:befor
  .student-work-count{justify-content:flex-start}
  .student-account .button.small,.student-no-work{width:100%}
 }
+
+/* Rifinitura colonne del pannello gestore */
+.student-table-head,.student-account{grid-template-columns:minmax(275px,1.15fr) minmax(370px,1.55fr) 72px minmax(180px,.75fr);gap:18px}
+.student-identifiers{display:block!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#66728a}
+.student-code{padding:0;border:0}
+.student-contact-pill{font-size:12px;max-width:245px}
+.student-contact-pill span{margin-bottom:2px}
+@media(max-width:1120px){
+ .student-account{grid-template-columns:minmax(245px,.9fr) minmax(330px,1.2fr) auto;gap:16px}
+}
+@media(max-width:700px){
+ .student-account{grid-template-columns:1fr}
+ .student-identifiers{white-space:normal}
+}
