@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,quote_id TEXT NOT NULL U
 CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,user_id TEXT,action TEXT NOT NULL,created BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,email TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,sent INTEGER NOT NULL DEFAULT 0,created BIGINT NOT NULL);
-CREATE TABLE IF NOT EXISTS communications(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,actor_id TEXT NOT NULL REFERENCES users(id),channel TEXT NOT NULL,subject TEXT NOT NULL DEFAULT '',body TEXT NOT NULL,outbox_id TEXT REFERENCES outbox(id),created BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS communications(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,actor_id TEXT NOT NULL REFERENCES users(id),channel TEXT NOT NULL,subject TEXT NOT NULL DEFAULT '',body TEXT NOT NULL,outbox_id TEXT REFERENCES outbox(id),created BIGINT NOT NULL,attachment_name TEXT,attachment_mime TEXT,attachment_data TEXT,attachment_sha TEXT);
 CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body TEXT NOT NULL,rating INTEGER NOT NULL,review_url TEXT NOT NULL,review_date TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 1,created BIGINT NOT NULL);'''
   with self.connect() as c:
    for q in schema.split(';'):
@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,author TEXT NOT NULL,body
    add_column('outbox','attempts','INTEGER NOT NULL DEFAULT 0')
    add_column('outbox','last_error','TEXT')
    add_column('outbox','sent_at','BIGINT')
+   add_column('outbox','attachment_name','TEXT')
+   add_column('outbox','attachment_mime','TEXT')
+   add_column('outbox','attachment_data','TEXT')
+   add_column('communications','attachment_name','TEXT')
+   add_column('communications','attachment_mime','TEXT')
+   add_column('communications','attachment_data','TEXT')
+   add_column('communications','attachment_sha','TEXT')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_facebook_id ON users(facebook_id) WHERE facebook_id IS NOT NULL')
    self.run(c,'CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL')
    self.run(c,'''INSERT INTO payments(id,quote_id,project_id,expected_cents,received_cents,status,created,updated)
@@ -152,8 +159,10 @@ class Site:
    self.db.run(c,'INSERT INTO rate_limits VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=rate_limits.count+1',(key,now()+seconds))
    r=self.db.run(c,'SELECT count FROM rate_limits WHERE key=?',(key,)).fetchone()
    if r['count']>maximum:raise Failure('Troppi tentativi. Riprova tra qualche minuto.',429)
- def mail(self,email,subject,body):
-  ident=uid();self.mutate('INSERT INTO outbox(id,email,subject,body,sent,created,attempts,last_error,sent_at) VALUES(?,?,?,?,0,?,0,NULL,NULL)',(ident,email,subject,body,now()))
+ def mail(self,email,subject,body,attachment=None):
+  ident=uid();name=mime=data=None
+  if attachment:name,mime,raw=attachment;data=base64.b64encode(raw).decode()
+  self.mutate('INSERT INTO outbox(id,email,subject,body,sent,created,attempts,last_error,sent_at,attachment_name,attachment_mime,attachment_data) VALUES(?,?,?,?,0,?,0,NULL,NULL,?,?,?)',(ident,email,subject,body,now(),name,mime,data))
   if not self.testing:self.send_mail(ident,email,subject,body)
   return ident
  def send_mail(self,ident,email,subject,body):
@@ -162,7 +171,11 @@ class Site:
    sender_name=self.cfg.get('MAIL_FROM_NAME','FormaTesi').strip() or 'FormaTesi'
    match=re.fullmatch(r'\\s*(.*?)\\s*<([^<>]+)>\\s*',sender_email)
    if match:sender_name=match.group(1).strip() or sender_name;sender_email=match.group(2).strip()
-   payload=json.dumps({'sender':{'name':sender_name,'email':sender_email},'to':[{'email':email}],'subject':subject,'textContent':body}).encode()
+   message={'sender':{'name':sender_name,'email':sender_email},'to':[{'email':email}],'subject':subject,'textContent':body}
+   archived=self.query('SELECT attachment_name,attachment_data FROM outbox WHERE id=?',(ident,),True)
+   if archived and archived.get('attachment_name') and archived.get('attachment_data'):
+    message['attachment']=[{'name':archived['attachment_name'],'content':archived['attachment_data']}]
+   payload=json.dumps(message).encode()
    req=urllib.request.Request('https://api.brevo.com/v3/smtp/email',data=payload,headers={'api-key':self.cfg['BREVO_API_KEY'],'Accept':'application/json','Content-Type':'application/json'})
    with urllib.request.urlopen(req,timeout=8) as response:
     if response.status not in (200,201):return
@@ -277,6 +290,12 @@ class Site:
    if not payment or not payment.get('proof_data'):raise Failure('Contabile non trovata.',404)
    self.owned(r,payment['project_id'])
    return base64.b64decode(payment['proof_data']),200,[('Content-Type',payment['proof_mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(payment['proof_name']))]
+  if p.startswith('/comunicazioni/') and p.endswith('/allegato'):
+   communication_id=p.strip('/').split('/')[1]
+   item=self.query('SELECT * FROM communications WHERE id=?',(communication_id,),True)
+   if not item or not item.get('attachment_data'):raise Failure('Allegato non trovato.',404)
+   self.owned(r,item['project_id'])
+   return base64.b64decode(item['attachment_data']),200,[('Content-Type',item['attachment_mime']),('Content-Disposition',"attachment; filename*=UTF-8''"+urllib.parse.quote(item['attachment_name']))]
   if p.startswith('/lavori/'):
    bits=p.strip('/').split('/');project=self.owned(r,bits[1]);action=bits[2] if len(bits)>2 else ''
    if action=='riepilogo.docx':
@@ -534,11 +553,11 @@ class Site:
     count=int(student.get('project_count') or 0);work_label='1 lavoro' if count==1 else f'{count} lavori'
     contacts=(f'<a href="mailto:{esc(contact)}">{esc(contact)}</a>' if contact else '<span class="missing-contact">Email non indicata</span>')
     if whatsapp:contacts+=f'<a href="https://wa.me/{esc(whatsapp)}" target="_blank" rel="noopener">WhatsApp +{esc(whatsapp)}</a>'
-    account_details=f'<span>Codice: <b>{esc(student["matricola"])}</b></span>'
-    if student.get('username'):account_details+=f'<span>Username: <b>{esc(student["username"])}</b></span>'
+    account_details=f'<span><b>{esc(student.get("username") or student["matricola"])}</b></span>'
+    if student.get('username'):account_details+=f'<span class="student-code">Codice: {esc(student["matricola"])}</span>'
     work_action=f'<a class="button small" href="/area?q={urllib.parse.quote(identifier)}">Vedi {work_label}</a>' if count else '<span class="student-no-work">Nessun lavoro inviato</span>'
-    rows.append(f'<article class="student-account"><div class="student-account-main"><span class="student-avatar" aria-hidden="true">{esc((full_name or identifier)[:1].upper())}</span><div><h3>{esc(full_name or "Studente FormaTesi")}</h3><div class="student-identifiers">{account_details}</div></div></div><div class="student-contacts">{contacts}</div><div class="student-registration"><span>Registrato il</span><b>{date(student["created"])}</b></div><div class="student-work-count"><strong>{count}</strong><span>{"Lavoro associato" if count==1 else "Lavori associati"}</span></div>{work_action}</article>')
-   student_directory=f'<details class="panel student-directory" open><summary><span><span class="eyebrow">ANAGRAFICA ACCOUNT</span><strong>Studenti registrati ({students})</strong></span></summary><p class="student-directory-intro">Qui compaiono tutti gli account, anche quelli che non hanno ancora inviato una richiesta.</p><div class="student-account-list">{"".join(rows) if rows else "<div class=\"empty compact\">Nessuno studente registrato.</div>"}</div></details>'
+    rows.append(f'<article class="student-account"><div class="student-account-main"><span class="student-avatar" aria-hidden="true">{esc((full_name or identifier)[:1].upper())}</span><h3>{esc(full_name or "Studente FormaTesi")}</h3><div class="student-identifiers">{account_details}</div></div><div class="student-contacts">{contacts}</div><div class="student-work-count"><strong>{count}</strong><span>{"lavoro" if count==1 else "lavori"}</span></div>{work_action}</article>')
+   student_directory=f'<details class="panel student-directory" open><summary><span><span class="eyebrow">ANAGRAFICA ACCOUNT</span><strong>Studenti registrati ({students})</strong></span></summary><p class="student-directory-intro">Una riga per ogni studente, compresi gli account senza richieste.</p><div class="student-table-head"><span>Studente e accesso</span><span>Contatti</span><span>Lavori</span><span>Azione</span></div><div class="student-account-list">{"".join(rows) if rows else "<div class=\"empty compact\">Nessuno studente registrato.</div>"}</div></details>'
   body=f'<section class="workspace"><div class="page-heading"><div><span class="eyebrow">{"Pannello di gestione" if admin else "ACCOUNT PERSONALE"}</span><h1>{"Tutti i lavori." if admin else "I miei lavori."}</h1><p>{"Le richieste da seguire, tutte qui." if admin else "Consegne, documenti e revisioni sempre disponibili nello stesso posto."}</p></div>{actions}</div>{mail}{insights}{student_directory}<div class="stats">'+''.join(f'<div><strong>{counts[k]:02}</strong><span>{v}</span></div>' for k,v in STATUS.items())+f'</div><div class="toolbar"><div class="filters"><a class="filter {"selected" if not status else ""}" href="/area">Tutti</a>{filters}</div><form method="get" class="search"><label class="sr-only" for="search">Cerca un lavoro</label><input id="search" name="q" placeholder="Cerca un lavoro…" value="{esc(search)}"><button aria-label="Cerca">⌕</button></form></div><div class="project-list">{cards}</div></section>'
   return self.page(r,'I miei lavori' if not admin else 'Gestione lavori',body),200,[]
  def new_project(self,r):
@@ -584,18 +603,24 @@ class Site:
    self.notify_admin(p,'Nuovo messaggio dello studente FormaTesi','Lo studente ha risposto dalla propria area personale.\n\nMessaggio:\n'+body)
    self.audit(r.user['id'],'message.portal:'+p['id']);return self.redirect('/lavori/'+p['id'])
   if action in ['messaggio-email','messaggio-whatsapp']:
-   student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True);body=r.require('message_body',4000)
+   student=self.query('SELECT * FROM users WHERE id=?',(p['user_id'],),True);body=r.require('message_body',4000);attachment=r.attachment()
    if action=='messaggio-email':
     recipient=student.get('contact_email') or (student['email'] if not student['email'].endswith('@pratica.invalid') else '')
     if not recipient:raise Failure('Lo studente non ha indicato un indirizzo email.',409)
     subject=r.require('message_subject',150)
-    outbox_id=self.mail(recipient,'FormaTesi · '+subject,body+'\n\nPer rispondere e conservare la conversazione nello storico, apri questo lavoro nella tua area personale:\n'+self.origin+'/lavori/'+p['id']+'\n\nFormaTesi')
-    self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'email',subject,body,outbox_id,now()))
+    outbox_id=self.mail(recipient,'FormaTesi · '+subject,body+'\n\nPer rispondere e conservare la conversazione nello storico, apri questo lavoro nella tua area personale:\n'+self.origin+'/lavori/'+p['id']+'\n\nFormaTesi',attachment)
+    name=mime=data=sha=None
+    if attachment:name,mime,raw=attachment;data=base64.b64encode(raw).decode();sha=hashlib.sha256(raw).hexdigest()
+    self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created,attachment_name,attachment_mime,attachment_data,attachment_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(uid(),p['id'],r.user['id'],'email',subject,body,outbox_id,now(),name,mime,data,sha))
     self.audit(r.user['id'],'message.email:'+p['id']);return self.redirect('/lavori/'+p['id'])
    number=phone_number(student.get('whatsapp',''))
    if not number:raise Failure('Lo studente non ha indicato un numero WhatsApp valido.',409)
-   self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created) VALUES(?,?,?,?,?,?,NULL,?)',(uid(),p['id'],r.user['id'],'whatsapp','Messaggio WhatsApp preparato',body,now()))
-   self.audit(r.user['id'],'message.whatsapp.opened:'+p['id']);return self.redirect('https://wa.me/'+number+'?text='+urllib.parse.quote(body))
+   communication_id=uid();name=mime=data=sha=None
+   if attachment:name,mime,raw=attachment;data=base64.b64encode(raw).decode();sha=hashlib.sha256(raw).hexdigest()
+   self.mutate('INSERT INTO communications(id,project_id,actor_id,channel,subject,body,outbox_id,created,attachment_name,attachment_mime,attachment_data,attachment_sha) VALUES(?,?,?,?,?,?,NULL,?,?,?,?,?)',(communication_id,p['id'],r.user['id'],'whatsapp','Messaggio WhatsApp preparato',body,now(),name,mime,data,sha))
+   outgoing=body
+   if attachment:outgoing+='\n\nAllegato disponibile nel tuo spazio FormaTesi:\n'+self.origin+'/comunicazioni/'+communication_id+'/allegato'
+   self.audit(r.user['id'],'message.whatsapp.opened:'+p['id']);return self.redirect('https://wa.me/'+number+'?text='+urllib.parse.quote(outgoing))
   if action=='consegna':
    recipient=self.query('SELECT email,contact_email FROM users WHERE id=?',(p['user_id'],),True)
    if not (recipient.get('contact_email') or (not recipient['email'].endswith('@pratica.invalid') and recipient['email'])):raise Failure('La consegna non può essere pubblicata finché lo studente non attiva l’email per le notifiche.',409)
@@ -776,7 +801,8 @@ class Site:
    elif item['channel']=='portale':state='Risposta ricevuta nel portale';state_class='received'
    else:state='Chat aperta · invio da confermare in WhatsApp';state_class='prepared'
    author='Studente' if item.get('actor_role')=='student' else 'FormaTesi'
-   rows+=f'<article class="communication-item"><div class="communication-heading"><span class="communication-channel {esc(item["channel"])}">{esc(item["channel"])}</span><time>{date(item["created"])}</time></div><span class="communication-author">DA: {author}</span><h3>{esc(item["subject"])}</h3><div class="prose">{esc(item["body"])}</div><span class="communication-state {state_class}">{esc(state)}</span></article>'
+   attachment_link=f'<a class="communication-attachment" href="/comunicazioni/{item["id"]}/allegato">📎 {esc(item["attachment_name"])}</a>' if item.get('attachment_name') else ''
+   rows+=f'<article class="communication-item"><div class="communication-heading"><span class="communication-channel {esc(item["channel"])}">{esc(item["channel"])}</span><time>{date(item["created"])}</time></div><span class="communication-author">DA: {author}</span><h3>{esc(item["subject"])}</h3><div class="prose">{esc(item["body"])}</div>{attachment_link}<span class="communication-state {state_class}">{esc(state)}</span></article>'
   if admin:
    if not rows:rows='<div class="empty compact"><h3>Nessuna comunicazione archiviata.</h3><p>Le email, i messaggi WhatsApp e le risposte dal portale compariranno qui.</p></div>'
    communications_html=f'<section class="panel communications-history"><span class="eyebrow">STORICO COMUNICAZIONI</span><h2>Email e messaggi</h2><p class="fine">Archivio collegato esclusivamente a questo lavoro.</p><div class="communications-list">{rows}</div></section>'
@@ -791,8 +817,9 @@ class Site:
    sender=self.cfg.get('MAIL_FROM') or self.cfg.get('ADMIN_EMAIL','')
    sender_match=re.fullmatch(r'\s*(.*?)\s*<([^<>]+)>\s*',sender);sender_address=sender_match.group(2) if sender_match else sender
    channels=''
-   if student_email:channels+=f'''<div class="message-channel"><h3>Email</h3><div class="message-route"><span><b>Da</b>{esc(sender_address)}</span><span><b>A</b>{esc(student_email)}</span></div><form method="post" action="/lavori/{p["id"]}/messaggio-email" class="manager-message-form">{r.csrf()}{field('message_subject','Oggetto del messaggio',placeholder='Es. Chiarimento sul materiale inviato')}<label>Messaggio<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button full">Invia email allo studente ↗</button></form></div>'''
-   if student.get('whatsapp'):channels+=f'''<div class="message-channel"><h3>WhatsApp</h3><div class="message-route single"><span><b>A</b>+{esc(student["whatsapp"])}</span></div><form method="post" action="/lavori/{p["id"]}/messaggio-whatsapp" class="manager-message-form">{r.csrf()}<label>Messaggio WhatsApp<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label><button class="button secondary full">Apri il messaggio su WhatsApp ↗</button><p class="fine">Si apre la chat con il testo già preparato: premi Invia dentro WhatsApp.</p></form></div>'''
+   attachment_fields='<label>Allega un file (facoltativo)<input type="file" accept=".pdf,.docx,.txt"></label><p class="fine">PDF, DOCX o TXT · massimo 5 MB</p><input type="hidden" name="file_name"><input type="hidden" name="file_data"><p role="status" data-upload-status></p>'
+   if student_email:channels+=f'''<div class="message-channel"><h3>Email</h3><div class="message-route"><span><b>Da</b>{esc(sender_address)}</span><span><b>A</b>{esc(student_email)}</span></div><form method="post" action="/lavori/{p["id"]}/messaggio-email" class="manager-message-form" data-upload>{r.csrf()}{field('message_subject','Oggetto del messaggio',placeholder='Es. Chiarimento sul materiale inviato')}<label>Messaggio<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label>{attachment_fields}<button class="button full">Invia email allo studente ↗</button></form></div>'''
+   if student.get('whatsapp'):channels+=f'''<div class="message-channel"><h3>WhatsApp</h3><div class="message-route single"><span><b>A</b>+{esc(student["whatsapp"])}</span></div><form method="post" action="/lavori/{p["id"]}/messaggio-whatsapp" class="manager-message-form" data-upload>{r.csrf()}<label>Messaggio WhatsApp<textarea name="message_body" rows="5" maxlength="4000" required>{esc(default_message)}</textarea></label>{attachment_fields}<button class="button secondary full">Apri il messaggio su WhatsApp ↗</button><p class="fine">Il file viene salvato nel portale e nel messaggio compare un collegamento protetto. Dentro WhatsApp dovrai soltanto premere Invia.</p></form></div>'''
    if not channels:channels='<p class="notice">Lo studente non ha ancora indicato un recapito.</p>'
    email_row=f'<dt>Email</dt><dd>{esc(student_email)}</dd>' if student_email else ''
    whatsapp_row=f'<dt>WhatsApp</dt><dd>+{esc(student["whatsapp"])}</dd><dt>Avvisi WhatsApp</dt><dd>{"Autorizzati" if student.get("whatsapp_opt_in") else "Non autorizzati"}</dd>' if student.get('whatsapp') else ''
