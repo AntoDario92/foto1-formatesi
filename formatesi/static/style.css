@@ -205,3 +205,41 @@ footer a[href*="facebook.com"]:before{color:#1877f2}footer a[href*="m.me"]:befor
 .payment-card{border:2px solid #dfe4f0;background:#fff}.payment-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:15px}.payment-heading h2{font-size:25px;margin:6px 0 18px}.payment-status{display:inline-flex;padding:8px 11px;border-radius:999px;font-size:12px;font-weight:850;line-height:1.3;text-align:center}.payment-pending{background:#fff2d8;color:#755000}.payment-proof_submitted{background:#edf1ff;color:#273f91}.payment-partial{background:#ffe8c2;color:#7a4700}.payment-paid{background:#e4f7e8;color:#17602a}.payment-summary{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:8px 0 22px}.payment-summary>div{padding:15px 11px;border-right:1px solid var(--line)}.payment-summary>div:last-child{border:0}.payment-summary span{display:block;font-size:11px;color:var(--muted);font-weight:800;line-height:1.35}.payment-summary strong{display:block;margin-top:7px;font-size:20px;color:var(--blue)}.payment-residual{background:#fff8ed}.payment-details{margin:14px 0}.payment-form{margin-top:22px;padding-top:20px;border-top:1px solid var(--line)}.payment-form textarea,[data-payment-upload] textarea{text-transform:none}
 @media(max-width:520px){.payment-heading{display:block}.payment-status{margin-bottom:16px}.payment-summary{grid-template-columns:1fr}.payment-summary>div{border-right:0;border-bottom:1px solid var(--line)}.payment-summary>div:last-child{border-bottom:0}.payment-summary span{font-size:12px}.payment-summary strong{font-size:23px}}
 .communication-author{display:block;margin:8px 0 2px;color:var(--muted);font-size:11px;font-weight:850}.communication-channel.portale{background:#e8f4e9;color:#276036}.communication-state.received{background:#e8f4e9;color:#276036}.student-reply>p{font-size:15px}.student-thread{margin-top:25px;padding-top:20px}.student-thread .communications-list{margin-top:18px}
+
+/* Elenco studenti: una scheda-riga leggibile, senza sovrapposizioni */
+.student-directory{box-shadow:0 16px 45px rgba(7,21,46,.08)}
+.student-directory>summary{background:linear-gradient(135deg,#f7f8fc,#f1f4fb)}
+.student-table-head,.student-account{grid-template-columns:minmax(245px,1.05fr) minmax(390px,1.7fr) 80px minmax(180px,.8fr);gap:22px}
+.student-table-head{border-bottom:2px solid var(--line);padding-inline:18px;letter-spacing:.07em}
+.student-account{min-height:82px;padding:12px 18px;transition:background .2s ease}
+.student-account:hover{background:#fafbff}
+.student-account-main{gap:12px;white-space:normal}
+.student-avatar{width:38px;height:38px;flex-basis:38px;border-radius:12px;background:linear-gradient(145deg,#e7ecff,#f5e8ef);font-size:17px}
+.student-identity{min-width:0}
+.student-account h3{font-size:15px;margin:0 0 4px;color:var(--ink)}
+.student-identifiers{margin:0;gap:8px;font-size:11px}
+.student-code{padding-left:8px;border-left:1px solid var(--line)}
+.student-contacts{display:flex;align-items:center;gap:8px;overflow:hidden}
+.student-contact-pill{display:flex;flex-direction:column;justify-content:center;min-width:0;max-width:230px;padding:7px 10px;border:1px solid #dfe4ef;border-radius:10px;background:#fff;color:var(--blue)!important;font-size:11px;line-height:1.25;text-decoration:none!important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.student-contact-pill span{font-size:9px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.student-contact-pill.email:hover{border-color:#9fb4e9;background:#f5f8ff}
+.student-contact-pill.whatsapp{color:#176b38!important;border-color:#cde8d6;background:#f5fcf7}
+.student-contact-pill.whatsapp span{color:#23824b}
+.student-contact-pill.missing-contact{display:block;color:#9b3340!important;background:#fff7f8}
+.student-work-count strong{font-size:22px}
+.student-account .button.small{border-radius:10px;box-shadow:0 8px 20px rgba(181,9,76,.16)}
+@media(max-width:1120px){
+ .student-table-head{display:none}
+ .student-account{grid-template-columns:minmax(260px,1fr) minmax(280px,1.2fr) auto;padding-block:15px}
+ .student-contacts{flex-wrap:wrap}.student-contact-pill{max-width:100%}
+ .student-account>.button,.student-account>.student-no-work{grid-column:3;grid-row:1/3}
+}
+@media(max-width:700px){
+ .student-account{grid-template-columns:1fr;padding:16px 0;gap:12px}
+ .student-account-main,.student-contacts,.student-work-count,.student-account>.button,.student-account>.student-no-work{grid-column:1;grid-row:auto}
+ .student-identifiers{flex-wrap:wrap;white-space:normal}
+ .student-contacts{display:grid;grid-template-columns:1fr;gap:7px}
+ .student-contact-pill{width:100%;max-width:none;font-size:12px}
+ .student-work-count{justify-content:flex-start}
+ .student-account .button.small,.student-no-work{width:100%}
+}
